@@ -1,0 +1,8 @@
+build/
+.venv
+__pycache__/
+*.pyc
+.DS_Store
+# raw mesh packs (regenerate with tools/make_city.py / make_props.py); the repo ships the .rz packs
+assets/city.bin
+assets/props.bin

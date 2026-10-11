@@ -1,0 +1,1092 @@
+    // ------------------------------------------------------------ uniforms
+    @inline private w4(off: f64, x: f64, y: f64, z: f64, w: f64): void {
+        let b = this.scratch;
+        Buffer.writef32(b, off, x);
+        Buffer.writef32(b, off + 4, y);
+        Buffer.writef32(b, off + 8, z);
+        Buffer.writef32(b, off + 12, w);
+    }
+
+    shCx: f64 = 1e9;
+    shCz: f64 = 1e9;
+    shValid: bool = false;
+    shDirty: bool = true;
+    shadowRenders: i32 = 0;
+
+    private writeUBO(o: Obj): void {
+        let ubo = o.ubo;
+        if (ubo == null) {
+            return;
+        }
+        o.model.writeToBuffer(this.scratch, 0);
+        let c = o.day;
+        // authored as sRGB, shaded in linear
+        this.w4(64, Math.pow(c.r, 2.2), Math.pow(c.g, 2.2), Math.pow(c.b, 2.2), o.rough);
+        this.w4(80, 0, <f64>o.mode, o.metal, o.emis);
+        this.w4(96, o.bright, o.flash, o.accentMix, o.auxW);
+        let a = o.accent;
+        let ac = a != null ? a : this.ambC;
+        this.w4(112, ac.r, ac.g, ac.b, o.emis);
+        this.w4(128, o.fx[0], o.fx[1], o.fx[2], o.fx[3]);
+        ubo.update(0, this.scratch, UBO_SIZE);
+    }
+
+    private updateSunCam(): void {
+        let e = this.eye;
+        let fwd = vsub(this.target, e);
+        let fl = Math.sqrt(<f64>fwd.x * <f64>fwd.x + <f64>fwd.z * <f64>fwd.z);
+        let fx: f64 = 0;
+        let fz: f64 = 0;
+        if (fl > 1e-4) {
+            fx = <f64>fwd.x / fl;
+            fz = <f64>fwd.z / fl;
+        }
+        // centre the map a little ahead of the camera, snapped to limit shimmer
+        let snap: f64 = 8;
+        let cx = Math.floor((<f64>e.x + fx * SHADOW_HALF * 0.55) / snap + 0.5) * snap;
+        let cz = Math.floor((<f64>e.z + fz * SHADOW_HALF * 0.55) / snap + 0.5) * snap;
+        // casters are static: re-render only when the snapped centre moves,
+        // while the city is still rising, or after night (no shadows) ends
+        this.shDirty = !this.shValid || cx != this.shCx || cz != this.shCz || this.riseR < 6000;
+        this.shCx = cx;
+        this.shCz = cz;
+        let c = V(cx, 120, cz);
+        let view = Mat4.lookAtVector(vadd(c, sunDir(), 1600), c, V(0, 1, 0));
+        // explicit RH ortho, z: -near -> 0, -far -> 1 (WebGPU depth range)
+        let h = SHADOW_HALF;
+        let n: f64 = 10;
+        let fa: f64 = 3400;
+        let proj = Mat4.values(<f32>(1 / h), 0, 0, 0, 0, <f32>(1 / h), 0, 0, 0, 0, <f32>(-1 / (fa - n)), 0, 0, 0, <f32>(-n / (fa - n)), 1);
+        this.shadowVP = proj * view;
+    }
+
+    // tight sun camera around the player car: cabin + body self-shadowing
+    private updateCarSunCam(): void {
+        let c = this.carModel.transformPoint(0, 0.85, 0.1);
+        this.carOrigin = c;
+        // relative to the car: shadow depth compares stay sub-millimetre
+        let view = Mat4.lookAtVector(vscale(sunDir(), 20), V(0, 0, 0), V(0, 1, 0));
+        let h: f64 = 3.1;
+        let n: f64 = 0.5;
+        let fa: f64 = 40;
+        let proj = Mat4.values(<f32>(1 / h), 0, 0, 0, 0, <f32>(1 / h), 0, 0, 0, 0, <f32>(-1 / (fa - n)), 0, 0, 0, <f32>(-n / (fa - n)), 1);
+        this.carVP = proj * view;
+        this.carShOn = this.night < 0.5 && vlen(vsub(this.eye, this.carPos)) < 90;
+    }
+
+    private writeFrame(ubo: GPUBuffer?, vp: Mat4, org: Vector, reflPass: bool, cabPass: bool): void {
+        if (ubo == null) {
+            return;
+        }
+        let b = this.scratch;
+        vp.writeToBuffer(b, 0);
+        this.view.writeToBuffer(b, 64);
+        this.invVP.writeToBuffer(b, 128);
+        let nt = this.night;
+        let e = this.eye;
+        this.w4(192, <f64>e.x, <f64>e.y, <f64>e.z, this.time);
+        let hz = mix3(hex(0xB9AFA6), hex(0x3A1424), nt);
+        let zz = mix3(hex(0x6F7F95), hex(0x05060C), nt);
+        this.w4(208, hz.r, hz.g, hz.b, 0.0034 + 0.0012 * nt);
+        this.w4(224, zz.r, zz.g, zz.b, 85);
+        // the main pass samples the reflection texture at its own screen position
+        let rs: f64 = reflPass ? 0.5 : 1;
+        this.w4(240, nt, this.rain * nt, <f64>this.gw * rs, <f64>this.gh * rs);
+        let sd = vnorm(vadd(vscale(sunDir(), 1 - nt), moonDir(), nt));
+        this.w4(256, <f64>sd.x, <f64>sd.y, <f64>sd.z, 1);
+        this.w4(272, 1.0 + 0.4 * nt, 1, reflPass ? 1 : 0, cabPass ? 1 : 0);
+        this.w4(288, <f64>this.origin.x, <f64>this.origin.z, this.riseR, this.powerR);
+        let hl: f64 = this.boot > T_AMB ? 1 : 0;
+        this.w4(304, <f64>this.carPos.x, <f64>this.carPos.y, <f64>this.carPos.z, hl * (0.3 + 0.7 * nt));
+        this.w4(320, <f64>this.carFwd.x, <f64>this.carFwd.z, this.v, this.alt);
+        let gp = tp(this.carModel, Cab.csPos);
+        this.w4(336, <f64>gp.x, <f64>gp.y, <f64>gp.z, (0.25 + 0.6 * nt) * clamp((this.boot - T_AMB) / 1.5, 0, 1));
+        let ac = this.ambC;
+        this.w4(352, ac.r, ac.g, ac.b, <f64>this.lights.length);
+        for (let i = 0; i < 16; i++) {
+            let off = <f64>(368 + i * 32);
+            if (i < this.lights.length) {
+                let l = this.lights[i];
+                this.w4(off, l.x, l.y, l.z, l.r);
+                this.w4(off + 16, l.cr, l.cg, l.cb, l.k);
+            } else {
+                this.w4(off, 0, -1000, 0, 0);
+                this.w4(off + 16, 0, 0, 0, 0);
+            }
+        }
+        // sky / sun / haze
+        this.shadowVP.writeToBuffer(b, 880);
+        // w: shadows on (>= 0.5); 0.5..1 also carries the fog-beam strength (softer under the title)
+        let beamK = 1 - 0.65 * smooth5(this.titleK);
+        this.w4(944, 7.2 + (0.05 - 7.2) * nt, 5.0 + (0.06 - 5.0) * nt, 3.2 + (0.09 - 3.2) * nt, nt < 0.5 ? 0.5 + 0.5 * beamK : 0);
+        this.w4(960, 0.27 + (0.006 - 0.27) * nt, 0.37 + (0.008 - 0.37) * nt, 0.54 + (0.018 - 0.54) * nt, 0.5);
+        this.w4(976, 1.0 + (0.10 - 1.0) * nt, 0.78 + (0.045 - 0.78) * nt, 0.6 + (0.08 - 0.6) * nt, 0.0025 + 0.0008 * nt);
+        this.w4(992, 0.5 + (0.05 - 0.5) * nt, 0.5 + (0.035 - 0.5) * nt, 0.53 + (0.07 - 0.53) * nt, 200);
+        this.carVP.writeToBuffer(b, 1008);
+        this.w4(1072, this.carShOn ? 1 : 0, 0.62, 0, 0);
+        this.w4(1088, <f64>org.x, <f64>org.y, <f64>org.z, 0);
+        let co = this.carOrigin;
+        this.w4(1104, <f64>co.x, <f64>co.y, <f64>co.z, 0);
+        ubo.update(0, b, FRAME_SIZE);
+    }
+
+    // null frustum = draw everything
+    private cull: Frustum? = null;
+    private frMain: Frustum = new Frustum();
+    private frRefl: Frustum = new Frustum();
+    private frShadow: Frustum = new Frustum();
+    drawn: f64 = 0;
+    total: f64 = 0;
+    cullLogged: bool = false;
+
+    // would any chunk of o be drawn by the main or the mirror pass this frame?
+    private objSeen(o: Obj): bool {
+        let m = o.mesh;
+        if (!o.visible || m == null) {
+            return false;
+        }
+        let ch = m.chunks;
+        if (ch.length == 0) {
+            return true;
+        }
+        for (let i = 0; i < ch.length; i++) {
+            if (this.frMain.visible(ch[i]) || this.frRefl.visible(ch[i])) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private drawObj(pass: GPURenderPass, o: Obj, bg: GPUBindGroup): void {
+        let m = o.mesh;
+        if (m == null) {
+            return;
+        }
+        let vb = m.vbuf;
+        let ib = m.ibuf;
+        if (vb == null || ib == null) {
+            return;
+        }
+        pass.setBindGroup(0, bg);
+        pass.setVertexBuffer(0, vb);
+        pass.setIndexBuffer(ib, <u32>IndexFormat.uint32);
+        let fr = this.cull;
+        let ch = m.chunks;
+        if (fr == null || ch.length == 0) {
+            pass.drawIndexed(m.count);
+            return;
+        }
+        // merge consecutive visible chunks into one draw
+        let runFirst: u32 = 0;
+        let runCount: u32 = 0;
+        for (let i = 0; i < ch.length; i++) {
+            let c = ch[i];
+            this.total += <f64>c.count;
+            if (fr.visible(c)) {
+                this.drawn += <f64>c.count;
+                if (runCount > 0 && runFirst + runCount == c.first) {
+                    runCount += c.count;
+                } else {
+                    if (runCount > 0) {
+                        pass.drawIndexed(runCount, 1, runFirst);
+                    }
+                    runFirst = c.first;
+                    runCount = c.count;
+                }
+            }
+        }
+        if (runCount > 0) {
+            pass.drawIndexed(runCount, 1, runFirst);
+        }
+    }
+
+    private frameFx(): void {
+        let b = this.boot;
+        let cl = this.clFace;
+        if (cl != null) {
+            cl.fx[1] = clamp((b - T_CL) / 0.5, 0, 1);
+            cl.bright = b >= T_CL ? 1 : 0;
+        }
+        let cs = this.csFace;
+        if (cs != null) {
+            cs.fx[1] = clamp((b - T_CS) / 0.55, 0, 1);
+            cs.bright = b >= T_CS ? 1 : 0;
+        }
+        let hb = this.hubFace;
+        if (hb != null) {
+            hb.fx[1] = clamp((b - T_HUB) / 0.4, 0, 1);
+            hb.bright = b >= T_HUB ? 1 : 0;
+        }
+        let hd = this.hudObj;
+        if (hd != null) {
+            hd.fx[1] = clamp((b - T_HUD) / 1.1, 0, 1);
+            hd.bright = this.hudOn ? 1 : 0;
+        }
+        let am = this.ambObj;
+        if (am != null) {
+            am.fx[1] = clamp((b - T_AMB) / 0.9, 0, 1);
+        }
+        let gl = this.glassObj;
+        if (gl != null) {
+            gl.bright = 1;
+        }
+        for (let i = 0; i < this.ext.length; i++) {
+            let o = this.ext[i];
+            if (o.mode == 12) {
+                o.bright = 0.6 + clamp(this.v / 25, 0, 0.6) + clamp(this.altV * 0.1, 0, 0.4);
+            }
+        }
+    }
+
+    private colorAtt(view: GPUTextureView?, resolve: GPUTextureView?, load: LoadOp): GPUColorAttachment {
+        let c = new GPUColorAttachment();
+        c.view = view;
+        c.resolveTarget = resolve;
+        c.loadOp = load;
+        c.storeOp = StoreOp.store;
+        return c;
+    }
+
+    private full(gpu: GPUCanvas, view: GPUTextureView, pipe: GPUPipeline, bg: GPUBindGroup): void {
+        let pd = new GPUPassDesc();
+        pd.color = [this.colorAtt(view, null, LoadOp.clear)];
+        let p = gpu.beginRenderPass(pd);
+        p.setPipeline(pipe);
+        p.setBindGroup(0, bg);
+        p.draw(3);
+        p.finish();
+    }
+
+    // shaft strength: sun in front of the view (also when just off-screen), by day, out of the title
+    private shaftK(): f64 {
+        let sd = sunDir();
+        let fwd = vnorm(vsub(this.target, this.eye));
+        let facing = <f64>fwd.x * <f64>sd.x + <f64>fwd.y * <f64>sd.y + <f64>fwd.z * <f64>sd.z;
+        let o4 = new StaticArray<f32>(4);
+        this.viewProj.transformVec4(o4, <f32>(<f64>this.eye.x + <f64>sd.x * 5000), <f32>(<f64>this.eye.y + <f64>sd.y * 5000),
+            <f32>(<f64>this.eye.z + <f64>sd.z * 5000), 1);
+        let cw = <f64>o4[3];
+        if (cw <= 0.01 || facing <= 0) {
+            return 0;
+        }
+        this.sunU = (<f64>o4[0] / cw) * 0.5 + 0.5;
+        this.sunV = 1 - ((<f64>o4[1] / cw) * 0.5 + 0.5);
+        let t = clamp(facing / 0.55, 0, 1);
+        // half strength under the title: the white logo needs its contrast
+        return t * t * (3 - 2 * t) * (1 - this.night) * SHAFT_GAIN * (1 - 0.85 * smooth5(this.titleK));
+    }
+
+    private u16(ubo: GPUBuffer, x: f64, y: f64, z: f64, w: f64): void {
+        this.w4(0, x, y, z, w);
+        ubo.update(0, this.scratch, 16);
+    }
+
+    private imgSampler: ImageSampler = ImageSampler(ImageWrap.clamp, ImageWrap.clamp, ImageFilter.bilinear);
+
+    override draw(renderer: Renderer): void {
+        let gpu = this.gpu;
+        if (!this.gpuReady || gpu == null || this.litMS == null || this.hdrMSV == null || this.skyBG == null) {
+            return;
+        }
+        if (gpu.width == 0) {
+            return;
+        }
+        this.frameFx();
+        // 2. per-object uniforms + sun camera
+        let inside = this.inside;
+        let nearCar = vlen(vsub(this.eye, this.carPos)) < 30;
+        let ssr: f64 = this.envFrames > 1 && !inside ? 1 : 0;
+        for (let i = 0; i < this.objs.length; i++) {
+            let o = this.objs[i];
+            if (o.envMap) {
+                o.auxW = ssr;
+            }
+            if (o.visible && o.bg != null) {
+                this.writeUBO(o);
+            }
+        }
+        this.updateSunCam();
+        this.updateCarSunCam();
+        let zero = V(0, 0, 0);
+        let e = this.eye;
+        this.writeFrame(this.frameCarShadow, this.carVP, this.carOrigin, false, false);
+        let vpR = this.viewProj * Mat4.fromScale(1, -1, 1);
+        // mirror pass: mirror(wp) - eye == mirror(wp - mirror(eye))
+        let vpRRel = this.viewProjRel * Mat4.fromScale(1, -1, 1);
+        this.writeFrame(this.frameShadow, this.shadowVP, zero, false, false);
+        this.writeFrame(this.frameMain, this.viewProjRel, e, false, false);
+        this.writeFrame(this.frameRefl, vpRRel, V(<f64>e.x, -<f64>e.y, <f64>e.z), true, false);
+        this.writeFrame(this.frameCab, this.viewProjBRel, e, false, true);
+        this.frMain.set(this.viewProj);
+        this.frRefl.set(vpR);
+        this.frShadow.set(this.shadowVP);
+        // 1. live Rive surfaces -> textures. A billboard canvas renders only when a chunk of its design
+        // passes the main or mirrored frustum (the same test the draws use), so a skipped canvas is
+        // never sampled (a canvas that skips a frame samples as undefined). Cockpit screens follow
+        // sf.live (set in advance: near the car).
+        // cockpit screens: the HUD only shows from the seat; cluster / console / hub only when the car
+        // itself is inside the main frustum (chase / showroom see them through the canopy)
+        let cc = this.carChunk;
+        let p0 = this.carPos;
+        cc.minX = <f64>p0.x - 4;
+        cc.maxX = <f64>p0.x + 4;
+        cc.minY = <f64>p0.y - 2;
+        cc.maxY = <f64>p0.y + 3;
+        cc.minZ = <f64>p0.z - 4;
+        cc.maxZ = <f64>p0.z + 4;
+        let carSeen = this.inside || this.frMain.visible(cc) || this.frRefl.visible(cc);
+        for (let i = 0; i < this.surfs.length; i++) {
+            let sf = this.surfs[i];
+            if (i < 4 && sf.live) {
+                sf.live = i == 3 ? this.inside : carSeen;
+            }
+            if (i >= 4) {
+                sf.live = this.dbgNoCull;
+                for (let j = 0; j < this.bbObjs.length && !sf.live; j++) {
+                    let bo = this.bbObjs[j];
+                    sf.live = bo.tex == i + 1 && this.objSeen(bo);
+                }
+            }
+            let c = sf.canvas;
+            let inst = sf.inst;
+            if (c != null && inst != null && sf.live) {
+                let r = c.beginFrame(sf.clear);
+                if (r != null) {
+                    r.save();
+                    let k = <f32>(<f64>c.width / sf.w);
+                    r.transform(Mat2D.withScale(k, k));
+                    inst.draw(r);
+                    r.restore();
+                    c.endFrame();
+                }
+            }
+        }
+        this.drawn = 0;
+        this.total = 0;
+
+        // 2b. sun shadow map
+        let sp = this.shadowPipe;
+        if (this.night >= 0.5) {
+            this.shValid = false;
+        }
+        if (sp != null && this.night < 0.5 && this.shDirty) {
+            this.shValid = true;
+            this.shadowRenders++;
+            let pd = new GPUPassDesc();
+            pd.depthView = this.shadowAttV;
+            pd.depthLoadOp = LoadOp.clear;
+            pd.depthStoreOp = StoreOp.store;
+            pd.depthClearValue = 1;
+            let ps = gpu.beginRenderPass(pd);
+            ps.setViewport(0, 0, <f32>SHADOW_N, <f32>SHADOW_N);
+            ps.setScissor(0, 0, SHADOW_N, SHADOW_N);
+            ps.setPipeline(sp);
+            this.cull = this.frShadow;
+            for (let i = 0; i < this.objs.length; i++) {
+                let o = this.objs[i];
+                let bg = o.bgS;
+                if (o.visible && bg != null) {
+                    this.drawObj(ps, o, bg);
+                }
+            }
+            let gb = this.cm("gbox");
+            let gi = this.cm("greeble_inst");
+            if (this.greebleShadow != null && gb != null && gi != null && gb.vbuf != null && gi.vbuf != null) {
+                ps.setPipeline(this.greebleShadow!);
+                ps.setBindGroup(0, this.shadowSkyBG!);
+                ps.setVertexBuffer(0, gb.vbuf!);
+                ps.setVertexBuffer(1, gi.vbuf!);
+                ps.setIndexBuffer(gb.ibuf!, <u32>IndexFormat.uint32);
+                ps.drawIndexed(gb.count, gi.vcount);
+            }
+            ps.finish();
+            this.cull = null;
+        }
+
+        // 2c. car self-shadow map
+        if (sp != null && this.carShOn) {
+            let pd = new GPUPassDesc();
+            pd.depthView = this.shadowAttV;
+            pd.depthLoadOp = LoadOp.load;
+            pd.depthStoreOp = StoreOp.store;
+            let pc = gpu.beginRenderPass(pd);
+            pc.setViewport(<f32>SHADOW_N, 0, <f32>CAR_SN, <f32>CAR_SN);
+            pc.setScissor(SHADOW_N, 0, CAR_SN, CAR_SN);
+            // clear just the car's region (the city map stays cached)
+            pc.setPipeline(this.clearPipe!);
+            pc.setBindGroup(0, this.skyBG!);
+            pc.draw(3);
+            pc.setPipeline(sp);
+            for (let i = 0; i < this.objs.length; i++) {
+                let o = this.objs[i];
+                let bg = o.bgCS;
+                if (o.visible && bg != null) {
+                    this.drawObj(pc, o, bg);
+                }
+            }
+            pc.finish();
+        }
+
+        // 3. mirrored world for the wet streets
+        {
+            let pd = new GPUPassDesc();
+            pd.color = [this.colorAtt(this.reflV, null, LoadOp.clear)];
+            pd.depthView = this.reflDepthV;
+            pd.depthLoadOp = LoadOp.clear;
+            pd.depthStoreOp = StoreOp.discard;
+            let pr = gpu.beginRenderPass(pd);
+            pr.setPipeline(this.litR!);
+            this.cull = this.frRefl;
+            for (let i = 0; i < this.objs.length; i++) {
+                let o = this.objs[i];
+                let m = o.mode;
+                let bg = o.bgR;
+                if (o.visible && bg != null && o.refl && m != 3 && m != 4 && m != 13 && !(o.ext && inside) && !o.noRefl) {
+                    this.drawObj(pr, o, bg);
+                }
+            }
+            this.cull = null;
+            pr.setPipeline(this.skyR!);
+            pr.setBindGroup(0, this.skyRBG!);
+            pr.draw(3);
+            pr.finish();
+        }
+
+        // 4. world (MSAA HDR)
+        {
+            let pd = new GPUPassDesc();
+            pd.color = [this.colorAtt(this.hdrMSV, inside ? null : this.hdrV, LoadOp.clear)];
+            pd.depthView = this.depthMSV;
+            pd.depthLoadOp = LoadOp.clear;
+            pd.depthStoreOp = StoreOp.discard;
+            let pass = gpu.beginRenderPass(pd);
+            this.cull = this.frMain;
+            // depth pre-pass for the big occluders (facades are the expensive shader)
+            pass.setPipeline(this.depthMS!);
+            for (let i = 0; i < this.objs.length; i++) {
+                let o = this.objs[i];
+                let bg = o.bg;
+                if (o.visible && bg != null && o.mode == 2) {
+                    this.drawObj(pass, o, bg);
+                }
+            }
+            let cur = 0;
+            for (let i = 0; i < this.objs.length; i++) {
+                let o = this.objs[i];
+                let bg = o.bg;
+                let drawIt = bg != null && o.visible;
+                if (drawIt && o.pass == 2) {
+                    drawIt = !inside && nearCar;
+                } else if (drawIt && o.pass == 3) {
+                    drawIt = false;
+                }
+                if (drawIt && (o.glass || o.mode == 16)) {
+                    drawIt = false;
+                }
+                if (drawIt && bg != null) {
+                    let want = o.cull ? 2 : 1;
+                    if (want != cur) {
+                        pass.setPipeline(want == 2 ? this.litMSCull! : this.litMS!);
+                        cur = want;
+                    }
+                    this.drawObj(pass, o, bg);
+                }
+            }
+            this.cull = null;
+            let gb = this.cm("gbox");
+            let gi = this.cm("greeble_inst");
+            if (this.greebleMS != null && gb != null && gi != null && gb.vbuf != null && gi.vbuf != null) {
+                pass.setPipeline(this.greebleMS!);
+                pass.setBindGroup(0, this.skyBG!);
+                pass.setVertexBuffer(0, gb.vbuf!);
+                pass.setVertexBuffer(1, gi.vbuf!);
+                pass.setIndexBuffer(gb.ibuf!, <u32>IndexFormat.uint32);
+                pass.drawIndexed(gb.count, gi.vcount);
+            }
+            let swm = this.cm("swarmcar");
+            let swp = this.swarmPipe;
+            let swb = this.swarmBuf;
+            if (swp != null && swm != null && swb != null && swm.vbuf != null) {
+                pass.setPipeline(swp);
+                pass.setBindGroup(0, this.skyBG!);
+                pass.setVertexBuffer(0, swm.vbuf!);
+                pass.setVertexBuffer(1, swb);
+                pass.setIndexBuffer(swm.ibuf!, <u32>IndexFormat.uint32);
+                pass.drawIndexed(swm.count, <u32>Math.max(1, Math.floor(<f64>this.swarmN * this.swarmFrac)));
+            }
+            pass.setPipeline(this.skyMS!);
+            pass.setBindGroup(0, this.skyBG!);
+            pass.draw(3);
+            // light cones hanging in the haze
+            let co = this.conesObj;
+            if (co != null && co.bg != null && co.visible && this.coneMS != null) {
+                pass.setPipeline(this.coneMS!);
+                this.cull = this.frMain;
+                this.drawObj(pass, co, co.bg!);
+                this.cull = null;
+            }
+            // the player's smoked canopy, see-through to the sculpted cabin
+            if (!inside) {
+                pass.setPipeline(this.glassMS!);
+                for (let i = 0; i < this.ext.length; i++) {
+                    let o = this.ext[i];
+                    let bg = o.bg;
+                    if (o.glass && o.visible && bg != null) {
+                        this.drawObj(pass, o, bg);
+                    }
+                }
+            }
+            // holo blade signs (additive light)
+            let hob = this.holoBuf;
+            if (this.holoMS != null && hob != null && this.holoN > 0) {
+                pass.setPipeline(this.holoMS!);
+                pass.setBindGroup(0, this.skyBG!);
+                pass.setVertexBuffer(0, hob);
+                pass.draw(6, this.holoN);
+            }
+            // steam plumes (after the opaque city + cones, before rain)
+            let stb = this.steamBuf;
+            if (this.steamMS != null && stb != null && this.steamN > 0) {
+                pass.setPipeline(this.steamMS!);
+                pass.setBindGroup(0, this.skyBG!);
+                pass.setVertexBuffer(0, stb);
+                pass.draw(6 * 14, this.steamN);
+            }
+            if (this.rain * this.night > 0.02) {
+                pass.setPipeline(this.rainMS!);
+                pass.setBindGroup(0, this.skyBG!);
+                pass.draw(6 * 1100);
+            }
+            pass.finish();
+        }
+        // 4b. last-frame environment for the car's screen-space reflections
+        if (!inside && this.envBG != null) {
+            this.u16(this.envUbo!, 1.5 / <f64>this.gw, 1.5 / <f64>this.gh, 0, 0);
+            this.full(gpu, this.envV!, this.brightPipe!, this.envBG!);
+            this.envFrames++;
+        } else {
+            this.envFrames = 0;
+        }
+
+        // 5. cockpit (fresh depth range) + glass, resolve
+        if (inside) {
+            let pd = new GPUPassDesc();
+            pd.color = [this.colorAtt(this.hdrMSV, this.hdrV, LoadOp.load)];
+            pd.depthView = this.depthMSV;
+            pd.depthLoadOp = LoadOp.clear;
+            pd.depthStoreOp = StoreOp.discard;
+            let pb = gpu.beginRenderPass(pd);
+            pb.setPipeline(this.litMS!);
+            for (let i = 0; i < this.cab.length; i++) {
+                let o = this.cab[i];
+                let bg = o.bgC;
+                if (bg != null && o.visible && o.pass == 2) {
+                    this.drawObj(pb, o, bg);
+                }
+            }
+            pb.setPipeline(this.glassMS!);
+            let gl = this.glassObj;
+            if (gl != null && gl.bgC != null) {
+                this.drawObj(pb, gl, gl.bgC!);
+            }
+            let hd = this.hudObj;
+            if (hd != null && hd.bgC != null && this.boot >= T_HUD) {
+                // additive light; alpha min() tags lit HUD pixels as cockpit so TAA never smears them
+                pb.setPipeline(this.hudMS!);
+                this.drawObj(pb, hd, hd.bgC!);
+            }
+            pb.finish();
+        }
+
+        // 5c. title holo: fresh depth, additive light (alpha-tagged so TAA keeps it crisp)
+        if (this.holoOn && this.holo.length > 0) {
+            let pd = new GPUPassDesc();
+            pd.color = [this.colorAtt(this.hdrMSV, this.hdrV, LoadOp.load)];
+            pd.depthView = this.depthMSV;
+            pd.depthLoadOp = LoadOp.clear;
+            pd.depthStoreOp = StoreOp.discard;
+            let ph = gpu.beginRenderPass(pd);
+            if (this.holoBackMS != null) {
+                ph.setPipeline(this.holoBackMS!);
+                for (let i = 0; i < this.holoBacks.length; i++) {
+                    let hb = this.holoBacks[i];
+                    if (hb.visible && hb.bgC != null) {
+                        this.drawObj(ph, hb, hb.bgC!);
+                    }
+                }
+            }
+            ph.setPipeline(this.hudMS!);
+            for (let i = 0; i < this.holo.length; i++) {
+                let o = this.holo[i];
+                let bg = o.bgC;
+                if (o.visible && bg != null) {
+                    this.drawObj(ph, o, bg);
+                }
+            }
+            ph.finish();
+        }
+
+        if (!this.cullLogged && this.time > 22) {
+            this.cullLogged = true;
+            this.log("world: culling drew " + formatFixed(this.drawn / Math.max(this.total, 1) * 100, 1) + "% of chunked city indices");
+        }
+        // 5b. temporal AA (world layer; cockpit passes through)
+        let useTaa = this.taaPipe != null && this.taaBG.length == 2;
+        if (useTaa) {
+            let b = this.scratch;
+            let inv = this.viewProjRelNJ.invert();
+            (inv != null ? inv! : Mat4.identity()).writeToBuffer(b, 0);
+            this.prevVPRel.writeToBuffer(b, 64);
+            let ce = this.eye;
+            let pe = this.prevEye;
+            let dx = <f64>ce.x - <f64>pe.x;
+            let dy = <f64>ce.y - <f64>pe.y;
+            let dz = <f64>ce.z - <f64>pe.z;
+            let ok = this.taaValid && dx * dx + dy * dy + dz * dz < 40 * 40;
+            this.w4(128, dx, dy, dz, ok ? 1 : 0);
+            this.w4(144, 1 / <f64>this.gw, 1 / <f64>this.gh, 0.1, 0);
+            this.taaUbo!.update(0, b, 160);
+            this.full(gpu, this.taaV[this.taaIdx], this.taaPipe!, this.taaBG[this.taaIdx]);
+            this.prevVPRel = this.viewProjRelNJ;
+            this.prevEye = this.eye;
+            this.taaValid = true;
+        }
+
+        // 5c. sun shafts: march toward the sun's screen position over the sky
+        let shK = this.shaftK();
+        if (this.shaftPipe != null && this.shaftBG != null) {
+            this.u16(this.shaftUbo!, this.sunU, this.sunV, 0.55, 0.965);
+            this.full(gpu, this.shaftV!, this.shaftPipe!, this.shaftBG!);
+        }
+
+        // 6. bloom chain
+        this.u16(this.downUbos[0], 1.5 / <f64>this.gw, 1.5 / <f64>this.gh, 1.5, 0.7);
+        this.u16(this.downUbos[1], 1 / <f64>this.b1w, 1 / <f64>this.b1h, 0, 0);
+        this.u16(this.downUbos[2], 1 / <f64>this.b2w, 1 / <f64>this.b2h, 0, 0);
+        for (let i = 0; i < 6; i++) {
+            let lvl = i / 2;
+            let bw = <f64>(lvl == 0 ? this.b1w : (lvl == 1 ? this.b2w : this.b3w));
+            let bh = <f64>(lvl == 0 ? this.b1h : (lvl == 1 ? this.b2h : this.b3h));
+            let horiz = i % 2 == 0;
+            this.u16(this.blUbos[i], horiz ? 1 / bw : 0, horiz ? 0 : 1 / bh, 1.3, 0);
+        }
+        let bp = this.brightPipe!;
+        let lp = this.blurPipe!;
+        this.full(gpu, this.b1V!, bp, this.downBGs[0]);
+        this.full(gpu, this.b1tV!, lp, this.blBGs[0]);
+        this.full(gpu, this.b1V!, lp, this.blBGs[1]);
+        this.full(gpu, this.b2V!, bp, this.downBGs[1]);
+        this.full(gpu, this.b2tV!, lp, this.blBGs[2]);
+        this.full(gpu, this.b2V!, lp, this.blBGs[3]);
+        this.full(gpu, this.b3V!, bp, this.downBGs[2]);
+        this.full(gpu, this.b3tV!, lp, this.blBGs[4]);
+        this.full(gpu, this.b3V!, lp, this.blBGs[5]);
+
+        // 7. composite
+        let nt = this.night;
+        let spd = clamp((Math.abs(this.v) - 12) / 30, 0, 1) * 0.04 * (1 - this.camBlend * 0.5);
+        let zoom = Math.max(spd, this.camSpeed * 0.045);
+        let fwd = vsub(this.target, this.eye);
+        let o4 = new StaticArray<f32>(4);
+        this.viewProj.transformVec4(o4, <f32>(<f64>this.eye.x + <f64>fwd.x * 50), <f32>(<f64>this.eye.y + <f64>fwd.y * 50),
+            <f32>(<f64>this.eye.z + <f64>fwd.z * 50), 1);
+        let zx: f64 = 0.5;
+        let zy: f64 = 0.5;
+        let cw = <f64>o4[3];
+        if (cw > 0.01) {
+            zx = clamp((<f64>o4[0] / cw) * 0.5 + 0.5, 0.1, 0.9);
+            zy = clamp(1 - ((<f64>o4[1] / cw) * 0.5 + 0.5), 0.1, 0.9);
+        }
+        this.w4(0, 0.58 + 0.12 * nt, this.time, 0.001, 0.016);
+        this.w4(16, zx, zy, zoom, smooth5(this.titleK));
+        this.w4(32, 0.09, 0.13, 0.2, 0.32);
+        this.w4(48, 0.004 * nt, 0.002 * nt, 0.008 * nt, 1.18 - 0.06 * nt);
+        let dy = 1 - nt;
+        this.w4(64, 1 + 0.06 * dy, 1, 1 - 0.1 * dy, 0.34 * dy + 0.08 * nt);
+        let sc = SUN_TINT;
+        this.w4(80, sc.x * shK, sc.y * shK, sc.z * shK, 0);
+        this.finUbo!.update(0, this.scratch, 96);
+        {
+            let pd = new GPUPassDesc();
+            pd.color = [this.colorAtt(null, null, LoadOp.clear)];
+            let p3 = gpu.beginRenderPass(pd);
+            p3.setPipeline(this.finalPipe!);
+            p3.setBindGroup(0, useTaa ? this.finBGs[this.taaIdx] : this.finBG!);
+            p3.draw(3);
+            p3.finish();
+        }
+        if (useTaa) {
+            this.taaIdx = 1 - this.taaIdx;
+        }
+        renderer.save();
+        let inv = <f32>(1 / this.outScale);
+        renderer.transform(Mat2D.withScale(inv, inv));
+        renderer.drawImage(gpu.image, this.imgSampler, BlendMode.srcOver, <f32>this.worldOp);
+        renderer.restore();
+    }
+
+    // ------------------------------------------------------------ input
+    private reboot(): void {
+        // back to the title: overview + logo + ENTER THE CITY, the city rises again
+        this.boot = 0;
+        this.entered = false;
+        this.tt = 0;
+        this.enterT = -1;
+        if (this.loadT >= 0) {
+            this.loadT = 0;
+        }
+        this.v = 0;
+        this.autopilot = true;
+        this.mode = 0;
+        this.alt = 62;
+        this.altV = 0;
+        this.resetPose();
+        this.headYaw = 0;
+        this.headPitch = 0;
+        this.headVel = 0;
+        this.camMode = 0;
+        this.camBlend = 0;
+        this.instanceSurfs();
+        this.rebuildBindGroups();
+        this.cLogo.clear();
+        this.setLogo("logo", false);
+        this.setLogo("logoHub", false);
+        this.setLogo("logoBB", false);
+        // bump the decrypt cues so every string replays
+        this.setN("cue", this.getN("cue") + 1);
+    }
+
+    override keyboardEvent(event: KeyboardEvent): bool {
+        if (event.control || event.meta || event.alt) {
+            return false;
+        }
+        let k = <i32>event.key;
+        // title screen: only ENTER / SPACE (go), N (day/night) and R are live
+        if (!this.entered && k != KEY_ENTER && k != KEY_KP_ENTER && k != KEY_SPACE && k != KEY_N && k != KEY_R) {
+            return false;
+        }
+        let held = k == KEY_UP || k == KEY_DOWN || k == KEY_LEFT || k == KEY_RIGHT || k == KEY_W || k == KEY_A || k == KEY_S || k == KEY_D;
+        if (held) {
+            if (event.phase == "down" || event.phase == "repeat") {
+                this.keys[k] = true;
+            } else if (event.phase == "up") {
+                this.keys[k] = false;
+            }
+            return true;
+        }
+        if (event.phase != "down") {
+            return false;
+        }
+        if (!this.entered && (k == KEY_ENTER || k == KEY_KP_ENTER || k == KEY_SPACE)) {
+            this.enterCity();
+            return true;
+        }
+        if (k == KEY_R) {
+            this.reboot();
+        } else if (k == KEY_N) {
+            this.nightT = 1 - this.nightT;
+        } else if (k == KEY_M) {
+            this.mode = (this.mode + 1) % 3;
+        } else if (k == KEY_F) {
+            this.mode = this.mode == 2 ? 0 : 2;
+        } else if (k == KEY_C) {
+            this.camMode = this.camMode == 1 ? 0 : 1;
+        } else if (k == 79) {
+            // O: showroom orbit around the car
+            this.camMode = this.camMode == 2 ? 0 : 2;
+        } else if (k == KEY_P) {
+            this.setAutopilot(!this.autopilot);
+        } else if (k == KEY_T) {
+            this.selectTrack(this.track + 1);
+        } else if (k == KEY_H) {
+            this.hudOn = !this.hudOn;
+        } else if (k == KEY_E) {
+            this.togglePlay();
+        } else if (k == KEY_ESC && this.play > 0) {
+            this.play = 0;
+        } else {
+            return false;
+        }
+        return true;
+    }
+
+    // ray from a screen position (world space)
+    private ro: Vector = V(0, 0, 0);
+    private rd: Vector = V(0, 0, -1);
+
+    private screenRay(pos: Vector): void {
+        let nx = <f64>pos.x / this.sizeX * 2 - 1;
+        let ny = 1 - <f64>pos.y / this.sizeY * 2;
+        // analytic ray from the camera basis: unprojecting through the inverse of
+        // a near 0.25 / far 5000 matrix at ~1 km world coords loses metres in f32
+        // and made screen clicks miss depending on where the car was
+        let th = Math.tan(this.fov / 2);
+        let d = vadd(vadd(this.camF, this.camR, nx * th * this.camAspect), this.camU, ny * th);
+        this.ro = this.eye;
+        this.rd = vnorm(d);
+    }
+
+    private tryFlat(hit: Hit, k: i32, o: Obj?, w: f64, h: f64, zp: f64, round: f64, only: i32): void {
+        if (o == null || (only != 0 && only != k)) {
+            return;
+        }
+        let inv = o.model.invert();
+        if (inv == null) {
+            return;
+        }
+        let a = tp(inv, this.ro);
+        let b = tp(inv, vadd(this.ro, this.rd, 1));
+        let dz = <f64>b.z - <f64>a.z;
+        if (Math.abs(dz) < 1e-9) {
+            return;
+        }
+        let t = (zp - <f64>a.z) / dz;
+        if (t <= 0) {
+            return;
+        }
+        let x = <f64>a.x + (<f64>b.x - <f64>a.x) * t;
+        let y = <f64>a.y + (<f64>b.y - <f64>a.y) * t;
+        let u = x / w + 0.5;
+        let v = 0.5 - y / h;
+        if (round > 0) {
+            if (x * x + y * y > round * round && only == 0) {
+                return;
+            }
+        } else if ((u < 0 || u > 1 || v < 0 || v > 1) && only == 0) {
+            return;
+        }
+        let wt = vlen(vsub(V(x, y, zp), a));
+        if (wt < hit.t) {
+            let sf = this.surfs[k - 1];
+            hit.t = wt;
+            hit.k = k;
+            hit.p = V(u * sf.w, v * sf.h, 0);
+        }
+    }
+
+    private tryArc(hit: Hit, k: i32, o: Obj?, only: i32): void {
+        if (o == null || (only != 0 && only != k)) {
+            return;
+        }
+        let inv = o.model.invert();
+        if (inv == null) {
+            return;
+        }
+        let a = tp(inv, this.ro);
+        let b = tp(inv, vadd(this.ro, this.rd, 1));
+        let R = Cab.clR;
+        let ox = <f64>a.x;
+        let oz = <f64>a.z + R;
+        let dx = <f64>b.x - <f64>a.x;
+        let dy = <f64>b.y - <f64>a.y;
+        let dz = <f64>b.z - <f64>a.z;
+        let A_ = dx * dx + dz * dz;
+        let B_ = 2 * (ox * dx + oz * dz);
+        let C_ = ox * ox + oz * oz - R * R;
+        let disc = B_ * B_ - 4 * A_ * C_;
+        if (disc < 0 || A_ < 1e-12) {
+            return;
+        }
+        let t = (-B_ + Math.sqrt(disc)) / (2 * A_);
+        let x = <f64>a.x + dx * t;
+        let y = <f64>a.y + dy * t;
+        let z = <f64>a.z + dz * t;
+        let span = Cab.clW / R;
+        let ang = Math.atan2(x, z + R);
+        let u = (ang + span / 2) / span;
+        let v = 0.5 - y / Cab.clH;
+        if ((u < 0 || u > 1 || v < 0 || v > 1) && only == 0) {
+            return;
+        }
+        let wt = vlen(vsub(V(x, y, z), a));
+        if (wt < hit.t) {
+            let sf = this.surfs[k - 1];
+            hit.t = wt;
+            hit.k = k;
+            hit.p = V(u * sf.w, v * sf.h, 0);
+        }
+    }
+
+    // pick a cockpit screen / billboard (1-based surface index, artboard coords)
+    private pick(pos: Vector, only: i32): Hit {
+        let hit = new Hit();
+        if (this.sizeX <= 0) {
+            return hit;
+        }
+        this.screenRay(pos);
+        if (this.inside || this.camMode == 0) {
+            this.tryArc(hit, 1, this.clFace, only);
+            this.tryFlat(hit, 2, this.csFace, Cab.csW, Cab.csH, 0, 0, only);
+            this.tryFlat(hit, 3, this.hubFace, Cab.hubR * 2, Cab.hubR * 2, 0.0125, Cab.hubR, only);
+        }
+        if (hit.k > 0) {
+            return hit;
+        }
+        let ro = this.ro;
+        let rd = this.rd;
+        for (let i = 0; i < this.bbs.length; i++) {
+            let bb = this.bbs[i];
+            let k = 5 + bb.design;
+            if (only == 0 || only == k) {
+                let denom = <f64>rd.x * bb.nx + <f64>rd.z * bb.nz;
+                if (denom < -1e-6) {
+                    let t = ((<f64>bb.c.x - <f64>ro.x) * bb.nx + (<f64>bb.c.z - <f64>ro.z) * bb.nz) / denom;
+                    if (t > 0 && t < hit.t) {
+                        let hp = vadd(ro, rd, t);
+                        let lx = (<f64>hp.x - <f64>bb.c.x) * bb.rx + (<f64>hp.z - <f64>bb.c.z) * bb.rz;
+                        let ly = <f64>hp.y - <f64>bb.c.y;
+                        let u = lx / bb.w + 0.5;
+                        let v = 0.5 - ly / bb.h;
+                        if (u >= 0 && u <= 1 && v >= 0 && v <= 1) {
+                            let sf = this.surfs[k - 1];
+                            hit.t = t;
+                            hit.k = k;
+                            hit.p = V(u * sf.w, v * sf.h, 0);
+                        }
+                    }
+                }
+            }
+        }
+        return hit;
+    }
+
+    private surfInst(k: i32): Artboard? {
+        if (k <= 0 || k > this.surfs.length) {
+            return null;
+        }
+        return this.surfs[k - 1].inst;
+    }
+
+    override pointerMove(event: PointerEvent): void {
+        let pos = event.position;
+        if (!this.entered) {
+            // home screen: remember where the mouse is (-1..1) for the camera tilt
+            this.tmxT = clamp(<f64>pos.x / Math.max(this.sizeX, 1) * 2 - 1, -1, 1);
+            this.tmyT = clamp(<f64>pos.y / Math.max(this.sizeY, 1) * 2 - 1, -1, 1);
+            return;
+        }
+        if (this.down && this.pressSurf > 0) {
+            let h = this.pick(pos, this.pressSurf);
+            let inst = this.surfInst(this.pressSurf);
+            if (h.k > 0 && inst != null) {
+                inst.pointerMove(new PointerEvent(event.id, h.p));
+            }
+            event.hit();
+            return;
+        }
+        if (this.down && this.play == 2) {
+            event.hit();
+            return;
+        }
+        if (this.down) {
+            let dx = <f64>pos.x - <f64>this.downPos.x;
+            let dy = <f64>pos.y - <f64>this.downPos.y;
+            if (!this.dragging && dx * dx + dy * dy > DRAG_SLOP * DRAG_SLOP) {
+                this.dragging = true;
+                this.lookHome = false;
+            }
+            if (this.dragging) {
+                let mx = <f64>pos.x - <f64>this.lastPos.x;
+                let my = <f64>pos.y - <f64>this.lastPos.y;
+                this.headYaw = clamp(this.headYaw - mx * 0.004, -1.3, 1.3);
+                this.headPitch = clamp(this.headPitch - my * 0.003, -0.45, 0.5);
+                this.headVel = this.headVel * 0.5 - mx * 0.004 * 30;
+                this.lastPos = pos;
+                event.hit();
+                return;
+            }
+            this.lastPos = pos;
+        }
+        let h = this.pick(pos, 0);
+        if (h.k != this.hoverSurf && this.hoverSurf > 0) {
+            let inst = this.surfInst(this.hoverSurf);
+            if (inst != null) {
+                inst.pointerExit(new PointerEvent(event.id, V(-100, -100, 0)));
+            }
+        }
+        this.hoverSurf = h.k;
+        if (h.k > 0) {
+            let inst = this.surfInst(h.k);
+            if (inst != null) {
+                inst.pointerMove(new PointerEvent(event.id, h.p));
+            }
+        }
+    }
+
+    private pressP: Vector = V(0, 0, 0);
+
+    private rayHitsCar(pos: Vector): bool {
+        this.screenRay(pos);
+        let c = tp(this.carModel, V(0, 0.75, 0.1));
+        let oc = vsub(c, this.ro);
+        let t = vdot(oc, this.rd);
+        if (t < 0) {
+            return false;
+        }
+        let d2 = vdot(oc, oc) - t * t;
+        return d2 < 2.4 * 2.4;
+    }
+
+    override pointerDown(event: PointerEvent): void {
+        // title: any click engages (the holo button floats over the whole view)
+        if (!this.entered) {
+            this.enterCity();
+            return;
+        }
+        this.down = true;
+        this.dragging = false;
+        this.downPos = event.position;
+        this.lastPos = event.position;
+        this.headVel = 0;
+        let h = this.pick(event.position, 0);
+        this.pressSurf = h.k;
+        this.pressP = h.p;
+        if (h.k > 0) {
+            let inst = this.surfInst(h.k);
+            if (inst != null) {
+                inst.pointerDown(new PointerEvent(event.id, h.p));
+            }
+        }
+        event.hit();
+    }
+
+    override pointerUp(event: PointerEvent): void {
+        if (this.pressSurf > 0) {
+            let h = this.pick(event.position, this.pressSurf);
+            let inst = this.surfInst(this.pressSurf);
+            // always release the pressed artboard, even if the camera moved away
+            // meanwhile (a stuck press leaves its listeners dead)
+            if (inst != null) {
+                inst.pointerUp(new PointerEvent(event.id, h.k > 0 ? h.p : this.pressP));
+            }
+        }
+        if (this.dragging) {
+            this.releaseT = this.time;
+        }
+        this.down = false;
+        this.dragging = false;
+        this.pressSurf = 0;
+        event.hit();
+    }
+
+    override pointerExit(event: PointerEvent): void {
+        this.tmxT = 0;
+        this.tmyT = 0;
+        if (this.pressSurf > 0) {
+            let pi = this.surfInst(this.pressSurf);
+            if (pi != null) {
+                pi.pointerUp(new PointerEvent(event.id, this.pressP));
+            }
+        }
+        this.down = false;
+        this.dragging = false;
+        this.pressSurf = 0;
+        if (this.hoverSurf > 0) {
+            let inst = this.surfInst(this.hoverSurf);
+            if (inst != null) {
+                inst.pointerExit(new PointerEvent(event.id, V(-100, -100, 0)));
+            }
+        }
+        this.hoverSurf = 0;
+    }
+}

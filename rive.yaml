@@ -1,0 +1,12 @@
+name: rive-city
+main: Main
+scripting: wasm
+exclude:
+  - data
+  - tools
+  - build
+  - art
+  - .venv
+logs:
+  file: build/rive.log
+  problems: build/problems.log

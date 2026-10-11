@@ -1,0 +1,640 @@
+// world.as — Rive City (AnimaScript).
+//
+// A ScriptedLayout that owns the whole 3D world on a GPU canvas: the
+// procedural city (textured tower blocks, swarm traffic, billboards whose
+// faces are live Rive artboards), the hovercar and its cockpit (driver
+// display, centre screen, yoke hub and windshield HUD — all live artboards),
+// the sun shadow map, shadowed volumetric haze, HDR bloom/tonemap, the boot
+// sequence (logo -> city rise -> dive into the seat -> power-up), autopilot /
+// manual driving, AR markers and ray-cast input into every surface.
+//
+// GENERATED from tools/world_parts/*.as.part by tools/build_world.py — edit
+// the parts, not world.as.
+
+import { Layout, Context, DecodedImage, ImageDecodeListener } from "rive/host";
+import { Renderer } from "rive/renderer";
+import { Artboard } from "rive/artboard";
+import { PropertyNumber, PropertyString } from "rive/data";
+import { Mat4 } from "rive/mat4";
+import { clock } from "rive/os";
+import { Mat2D } from "rive/mat2d";
+import { Vector } from "rive/vector";
+import { Canvas } from "rive/canvas";
+import { ImageSampler, ImageWrap, ImageFilter } from "rive/image";
+import { BlendMode } from "rive/paint";
+import { KeyboardEvent, PointerEvent } from "rive/events";
+import { Buffer } from "rive/buffer";
+import { formatFixed, formatInt } from "rive/format";
+import {
+    GPUBuffer, GPUTexture, GPUTextureDesc, GPUTextureViewDesc, GPUSampler, GPUPipeline, GPUPipelineDesc,
+    GPUColorTargetDesc, GPUVertexBufferLayout, GPUVertexAttribute, GPUBindGroup, GPUBindGroupLayout, GPUBindGroupUBO,
+    GPUBindGroupTexture, GPUBindGroupSampler, GPUCanvas, GPUPassDesc, GPUColorAttachment, GPUDepthStencilDesc,
+    GPUTextureView, GPUBlendState, GPURenderPass, GPUShaderModule,
+} from "rive/gpu";
+import {
+    BufferUsage, TextureFormat, TextureType, TextureViewDimension, TextureAspect, Filter, WrapMode, VertexFormat,
+    VertexStepMode, CompareFunction, CullMode, LoadOp, StoreOp, IndexFormat, BlendFactor, BlendOp,
+} from "rive/gpu_enums";
+import { rive_gpu_texture_upload_v1 } from "rive/bindings";
+import { PackMesh, Pack, Chunk, loadPack } from "./pack";
+import { ChunkedInflate, openZ } from "./inflate";
+import * as City from "./cityinfo";
+import * as Cab from "./cabin";
+import * as TexInfo from "./texinfo";
+
+// ---------------------------------------------------------------- constants
+const UBO_SIZE: u32 = 160;
+const FRAME_SIZE: u32 = 1120;
+const CAR_SN: u32 = 1024;
+const SHADOW_N: u32 = 2048;
+const SHADOW_HALF: f64 = 700;
+const P: f64 = City.P;
+const NB: i32 = City.N;
+const ROUTE_N: i32 = City.routeN;
+const KMH: f64 = 3.6;
+const PI: f64 = Math.PI;
+
+const KEY_R: i32 = 82;
+const KEY_M: i32 = 77;
+const KEY_N: i32 = 78;
+const KEY_C: i32 = 67;
+const KEY_P: i32 = 80;
+const KEY_F: i32 = 70;
+const KEY_T: i32 = 84;
+const KEY_H: i32 = 72;
+const KEY_E: i32 = 69;
+const KEY_ESC: i32 = 256;
+// the playable SillyScroll board: billboard design 9 = surface 14 (1-based)
+const SILLY_DES: i32 = 9;
+const N_DES: i32 = 10;
+const PLAY_FOV: f64 = 40 * PI / 180;
+const KEY_UP: i32 = 265;
+const KEY_DOWN: i32 = 264;
+const KEY_LEFT: i32 = 263;
+const KEY_RIGHT: i32 = 262;
+const KEY_W: i32 = 87;
+const KEY_A: i32 = 65;
+const KEY_S: i32 = 83;
+const KEY_D: i32 = 68;
+const KEY_ENTER: i32 = 257;
+const KEY_KP_ENTER: i32 = 335;
+const KEY_SPACE: i32 = 32;
+const DRAG_SLOP: f64 = 5;
+const COCKPIT_ID: i32 = 200;
+
+const MODE_NAMES: StaticArray<string> = ["CRUISE", "SPORT", "SKY LANE"];
+const MODE_CRUISE: StaticArray<f64> = [62, 96, 84];
+const MODE_ACCEL: StaticArray<f64> = [3.0, 6.0, 4.0];
+
+const TRACK_TITLE: StaticArray<string> = ["NEON CATHEDRAL", "SKYLANE", "AFTERBURN", "MERIDIAN NIGHTS", "CHROME RAIN", "VECTOR HEART"];
+const TRACK_ARTIST: StaticArray<string> = ["VANTA ARC", "LUMEN DRIVE", "ROCKET SQUADRON OST", "HALO STATIC", "KODA & THE PRISM", "NULL SET"];
+const TRACK_DUR: StaticArray<f64> = [222, 245, 178, 211, 257, 189];
+const NTRACKS: i32 = 6;
+const BB_NAMES: StaticArray<string> = ["ROCKET SQUADRON", "RIVE", "KINETIC", "MERIDIAN LIVE", "SKYLINE ARCADE", "HOTEL AURORA", "NISHIKI", "AURA", "DEEPWATER", "SILLY SCROLL"];
+const AMB_HEX: StaticArray<u32> = [0xFFA41C, 0x19F2FF, 0xF30058, 0x3084FF, 0x71FF19, 0xE8ECF4];
+const AMB_NAMES: StaticArray<string> = ["AMBER", "CYAN", "MAGENTA", "BLUE", "VOLT", "WHITE"];
+const BB_LIGHT: StaticArray<f64> = [0.25, 0.45, 1.0, 0.9, 0.9, 1.0, 0.55, 1.0, 0.12, 1.0, 0.55, 0.15, 1.0, 0.1, 0.6, 0.1, 0.8, 1.0, 1.0, 0.4, 0.15, 1.0, 0.12, 0.5, 0.1, 0.75, 1.0, 1.0, 0.72, 0.35];
+const NPC_PAINT: StaticArray<u32> = [0xE9E7E2, 0x9A9DA3, 0x23262B, 0x1C1E22, 0x7A1A16, 0x5A5E66, 0x2C4A63, 0x30343B, 0xD9D2C3, 0x6B665C, 0x0F3D3A, 0x22252B];
+// shader material ids (lit.wgsl carMaterial)
+const MAT_PAINT: f64 = 0;
+const MAT_BLACK: f64 = 1;
+const MAT_CARBON: f64 = 2;
+const MAT_METAL: f64 = 3;
+const MAT_GLASS: f64 = 4;
+const MAT_LEATHER: f64 = 6;
+const MAT_SUEDE: f64 = 7;
+const MAT_SOFT: f64 = 8;
+const MAT_QUILT: f64 = 9;
+const MAT_GRILLE: f64 = 10;
+const MAT_CARPET: f64 = 11;
+
+// title: the boot clock holds at T_DIVE (dive start pose = city overview) until ENTER
+const T_LOGO: f64 = 2.0;       // Rive logo plays in once the city has fully risen (load time, s)
+const T_TITLE_UI: f64 = 2.4;   // FUI: its build (T_TITLE_UI + 0.35) starts as the logo's 0.75 s play-in ends
+// boot timeline (seconds since power-on)
+const T_LOGO_OUT: f64 = 2.6;
+const T_POWER: f64 = 3.5;
+const T_DIVE: f64 = 2.8;
+const DIVE_DUR: f64 = 7.4;
+const T_AMB: f64 = 9.4;
+const T_CL: f64 = 9.9;
+const T_CS: f64 = 10.2;
+const T_HUB: f64 = 10.4;
+const T_HUD: f64 = 10.7;
+const T_UI: f64 = 11.6;
+const T_READY: f64 = 12.0;
+const T_GO: f64 = 12.6;
+const START_S: f64 = 30;
+
+// ---------------------------------------------------------------- maths
+@inline function clamp(x: f64, a: f64, b: f64): f64 {
+    return x < a ? a : (x > b ? b : x);
+}
+
+@inline function V(x: f64, y: f64, z: f64): Vector {
+    return Vector.xyz(<f32>x, <f32>y, <f32>z);
+}
+
+function relBG(b: GPUBindGroup?): void {
+    if (b != null) {
+        b.release();
+    }
+}
+
+@inline function vcross(a: Vector, b: Vector): Vector {
+    let ax = <f64>a.x, ay = <f64>a.y, az = <f64>a.z;
+    let bx = <f64>b.x, by = <f64>b.y, bz = <f64>b.z;
+    return V(ay * bz - az * by, az * bx - ax * bz, ax * by - ay * bx);
+}
+
+@inline function vadd(a: Vector, b: Vector, k: f64): Vector {
+    return V(<f64>a.x + <f64>b.x * k, <f64>a.y + <f64>b.y * k, <f64>a.z + <f64>b.z * k);
+}
+
+function halton(i: i32, b: i32): f64 {
+    let f: f64 = 1;
+    let r: f64 = 0;
+    let n = i;
+    while (n > 0) {
+        f = f / <f64>b;
+        r = r + f * <f64>(n % b);
+        n = n / b;
+    }
+    return r;
+}
+
+@inline function vscale(a: Vector, k: f64): Vector {
+    return V(<f64>a.x * k, <f64>a.y * k, <f64>a.z * k);
+}
+
+@inline function vsub(a: Vector, b: Vector): Vector {
+    return V(<f64>a.x - <f64>b.x, <f64>a.y - <f64>b.y, <f64>a.z - <f64>b.z);
+}
+
+@inline function vlerp(a: Vector, b: Vector, t: f64): Vector {
+    return V(<f64>a.x + (<f64>b.x - <f64>a.x) * t, <f64>a.y + (<f64>b.y - <f64>a.y) * t, <f64>a.z + (<f64>b.z - <f64>a.z) * t);
+}
+
+@inline function vdot(a: Vector, b: Vector): f64 {
+    return <f64>a.x * <f64>b.x + <f64>a.y * <f64>b.y + <f64>a.z * <f64>b.z;
+}
+
+@inline function vlen(a: Vector): f64 {
+    return Math.sqrt(vdot(a, a));
+}
+
+@inline function vnorm(a: Vector): Vector {
+    let l = vlen(a);
+    return l > 1e-12 ? vscale(a, 1 / l) : a;
+}
+
+function smooth5(x: f64): f64 {
+    let t = clamp(x, 0, 1);
+    return t * t * t * (t * (t * 6 - 15) + 10);
+}
+
+function wrapAng(a: f64): f64 {
+    let x = (a + PI) % (2 * PI);
+    if (x < 0) {
+        x += 2 * PI;
+    }
+    return x - PI;
+}
+
+function wrapS(s: f64): f64 {
+    let x = s % <f64>ROUTE_N;
+    return x < 0 ? x + <f64>ROUTE_N : x;
+}
+
+// route sample as (x, 0, z)
+function routeAt(s: f64): Vector {
+    let ss = wrapS(s);
+    let i = <i32>Math.floor(ss);
+    let f = ss - <f64>i;
+    let j = (i + 1) % ROUTE_N;
+    let x0 = <f64>City.route[i * 2];
+    let z0 = <f64>City.route[i * 2 + 1];
+    let x1 = <f64>City.route[j * 2];
+    let z1 = <f64>City.route[j * 2 + 1];
+    return V(x0 + (x1 - x0) * f, 0, z0 + (z1 - z0) * f);
+}
+
+// unit direction (x, 0, z)
+function routeDir(s: f64): Vector {
+    let a = routeAt(s - 2);
+    let b = routeAt(s + 2);
+    let dx = <f64>b.x - <f64>a.x;
+    let dz = <f64>b.z - <f64>a.z;
+    let l = Math.sqrt(dx * dx + dz * dz);
+    if (l < 1e-6) {
+        return V(0, 0, -1);
+    }
+    return V(dx / l, 0, dz / l);
+}
+
+// yaw: forward = (sin yaw, -cos yaw)
+@inline function yawOf(fx: f64, fz: f64): f64 {
+    return Math.atan2(fx, -fz);
+}
+
+function basis(px: f64, py: f64, pz: f64, yaw: f64): Mat4 {
+    let fx = Math.sin(yaw);
+    let fz = -Math.cos(yaw);
+    let rx = -fz;
+    let rz = fx;
+    return Mat4.values(<f32>rx, 0, <f32>rz, 0, 0, 1, 0, 0, <f32>-fx, 0, <f32>-fz, 0, <f32>px, <f32>py, <f32>pz, 1);
+}
+
+@inline function tp(m: Mat4, p: Vector): Vector {
+    return m.transformPoint(p.x, p.y, p.z);
+}
+
+// Hermite spline through keys (times ts), zero end tangents
+function hermiteTan(ps: Array<Vector>, ts: Array<f64>, i: i32): Vector {
+    let n = ps.length;
+    if (i == 0 || i == n - 1) {
+        return V(0, 0, 0);
+    }
+    return vscale(vsub(ps[i + 1], ps[i - 1]), 1 / (ts[i + 1] - ts[i - 1]));
+}
+
+function hermite(ps: Array<Vector>, ts: Array<f64>, x: f64): Vector {
+    let n = ps.length;
+    if (x <= ts[0]) {
+        return ps[0];
+    }
+    if (x >= ts[n - 1]) {
+        return ps[n - 1];
+    }
+    let k = 0;
+    while (k < n - 2 && x > ts[k + 1]) {
+        k++;
+    }
+    let h = ts[k + 1] - ts[k];
+    let t = (x - ts[k]) / h;
+    let t2 = t * t;
+    let t3 = t2 * t;
+    let h00 = 2 * t3 - 3 * t2 + 1;
+    let h10 = t3 - 2 * t2 + t;
+    let h01 = -2 * t3 + 3 * t2;
+    let h11 = t3 - t2;
+    let m0 = vscale(hermiteTan(ps, ts, k), h);
+    let m1 = vscale(hermiteTan(ps, ts, k + 1), h);
+    let r = vscale(ps[k], h00);
+    r = vadd(r, m0, h10);
+    r = vadd(r, ps[k + 1], h01);
+    return vadd(r, m1, h11);
+}
+
+// critically damped spring; returns new x, writes velocity to out.v
+class Spring {
+    x: f64 = 0;
+    v: f64 = 0;
+}
+
+function cdSpring(out: Spring, x: f64, v: f64, target: f64, wn: f64, dt: f64): void {
+    let d = x - target;
+    let e = Math.exp(-wn * dt);
+    let tmp = (v + wn * d) * dt;
+    out.x = target + (d + tmp) * e;
+    out.v = (v - wn * tmp) * e;
+}
+
+// ---------------------------------------------------------------- colour
+class Col {
+    r: f64;
+    g: f64;
+    b: f64;
+    constructor(r: f64, g: f64, b: f64) {
+        this.r = r;
+        this.g = g;
+        this.b = b;
+    }
+}
+
+function hex(h: u32): Col {
+    return new Col(<f64>((h >> 16) & 255) / 255, <f64>((h >> 8) & 255) / 255, <f64>(h & 255) / 255);
+}
+
+function mix3(a: Col, b: Col, t: f64): Col {
+    return new Col(a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t, a.b + (b.b - a.b) * t);
+}
+
+function fmtM(m: f64): string {
+    if (m < 1000) {
+        return formatInt(Math.floor(m / 5 + 0.5) * 5) + " M";
+    }
+    return formatFixed(m / 1000, 1) + " KM";
+}
+
+// golden hour sun raking across the street grid
+const SUN_EL: f64 = 33 * PI / 180;
+const SHAFT_GAIN: f64 = 0.4;            // screen-space sun shafts (final.wgsl r.shaft)
+const SUN_TINT: Vector = Vector.xyz(1.0, 0.82, 0.6);
+const SUN_AZ: f64 = 197 * PI / 180;
+
+function sunDir(): Vector {
+    return vnorm(V(Math.cos(SUN_EL) * Math.cos(SUN_AZ), Math.sin(SUN_EL), Math.cos(SUN_EL) * Math.sin(SUN_AZ)));
+}
+
+function moonDir(): Vector {
+    return vnorm(V(0.35, 0.72, 0.42));
+}
+
+// ---------------------------------------------------------------- data types
+class Obj {
+    mesh: PackMesh? = null;
+    noRefl: bool = false;     // skip in the 1/3-res mirror pass (hairline geometry that can't resolve there)
+    ubo: GPUBuffer? = null;
+    bg: GPUBindGroup? = null;
+    bgR: GPUBindGroup? = null;
+    bgC: GPUBindGroup? = null;
+    bgS: GPUBindGroup? = null;
+    mode: i32 = 0;
+    id: i32 = 0;
+    day: Col = new Col(1, 1, 1);
+    model: Mat4 = Mat4.identity();
+    tex: i32 = 0;
+    bright: f64 = 1;
+    flash: f64 = 0;
+    accentMix: f64 = 0;
+    visible: bool = true;
+    pass: i32 = 1; // 1 city, 2 cockpit, 3 glass
+    cull: bool = false;
+    emis: f64 = 0;
+    fx: StaticArray<f64> = new StaticArray<f64>(4);
+    accent: Col? = null;
+    ext: bool = false; // player exterior part
+    rough: f64 = 0.5;
+    metal: f64 = 0;
+    refl: bool = true;
+    auxW: f64 = 0;
+    glass: bool = false; // player canopy (transparent, world pass, last)
+    castCar: bool = false; // casts into the car shadow map
+    envMap: bool = false; // samples last frame (screen-space reflections)
+    bgCS: GPUBindGroup? = null;
+}
+
+class Surf {
+    input: Artboard? = null;
+    inst: Artboard? = null;
+    canvas: Canvas? = null;
+    w: f64 = 512;
+    h: f64 = 512;
+    density: f64 = 1;
+    clear: u32 = 0;
+    live: bool = true;
+    pending: f64 = 0;   // advance time owed while the surface was culled
+}
+
+
+class Npc {
+    kind: i32 = 1; // 1 ground same dir, 2 ground opposite, 3 air
+    s: f64 = 0;
+    v: f64 = 0;
+    off: f64 = 0;
+    axis: i32 = 0;
+    line: f64 = 0;
+    alt: f64 = 0;
+    dir: f64 = 1;
+    pos: Vector = V(0, 0, 0);
+    yaw: f64 = 0;
+    scale: f64 = 1;
+    parts: Array<Obj> = [];
+    model: Mat4 = Mat4.identity();
+}
+
+class BB {
+    c: Vector = V(0, 0, 0);
+    nx: f64 = 0;
+    nz: f64 = 0;
+    rx: f64 = 0;
+    rz: f64 = 0;
+    w: f64 = 0;
+    h: f64 = 0;
+    design: i32 = 0;
+}
+
+class Marker {
+    x: f64 = 0;
+    y: f64 = 0;
+    op: f64 = 0;
+    q: i32 = 0;
+    vis: f64 = 1;
+    lvis: f64 = 1;
+    title: string = "";
+    dist: string = "";
+    key: f64 = -1;
+}
+
+class Cand {
+    d: f64 = 0;
+    b: BB;
+    constructor(d: f64, b: BB) {
+        this.d = d;
+        this.b = b;
+    }
+}
+
+class Want {
+    wp: Vector = V(0, 0, 0);
+    title: string = "";
+    dist: string = "";
+    key: f64 = 0;
+}
+
+class Light {
+    x: f64 = 0;
+    y: f64 = 0;
+    z: f64 = 0;
+    r: f64 = 0;
+    cr: f64 = 0;
+    cg: f64 = 0;
+    cb: f64 = 0;
+    k: f64 = 0;
+}
+
+// six clip planes from a view-projection (WebGPU depth 0..1)
+class Frustum {
+    p: StaticArray<f64> = new StaticArray<f64>(24);
+
+    set(m: Mat4): void {
+        let a = m.m;
+        for (let k = 0; k < 6; k++) {
+            let r = k >> 1;
+            let sgn: f64 = (k & 1) == 0 ? 1 : -1;
+            let o = k * 4;
+            for (let c = 0; c < 4; c++) {
+                let w = <f64>a[c * 4 + 3];
+                let v = <f64>a[c * 4 + r];
+                if (k == 4) {
+                    this.p[o + c] = v;                 // near: z >= 0
+                } else if (k == 5) {
+                    this.p[o + c] = w - <f64>a[c * 4 + 2]; // far: z <= w
+                } else {
+                    this.p[o + c] = w + sgn * v;
+                }
+            }
+        }
+    }
+
+    visible(c: Chunk): bool {
+        for (let k = 0; k < 6; k++) {
+            let o = k * 4;
+            let a = this.p[o];
+            let b = this.p[o + 1];
+            let cc = this.p[o + 2];
+            let d = this.p[o + 3];
+            let x = a > 0 ? c.maxX : c.minX;
+            let y = b > 0 ? c.maxY : c.minY;
+            let z = cc > 0 ? c.maxZ : c.minZ;
+            if (a * x + b * y + cc * z + d < 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+}
+
+class Hit {
+    t: f64 = 1e18;
+    k: i32 = 0;
+    p: Vector = V(0, 0, 0);
+}
+
+// HUD declutter: layout sizes mirrored from tools/gen_ui.py (TRK_W/H, MK_W/H, RO_*)
+const TRK_W: f64 = 156;
+const TRK_H: f64 = 96;
+const MK_W: f64 = 190;
+const MK_H: f64 = 44;
+// readout cluster rect on the HUD artboard (cx 600, RO_W 660, RO_Y 559) + margin
+const RO_X0: f64 = 256;
+const RO_X1: f64 = 944;
+const RO_Y0: f64 = 545;
+const RO_Y1: f64 = 720;
+// quadrant signs: 0 up-right, 1 up-left, 2 down-right, 3 down-left
+const Q_FX: StaticArray<f64> = [1, -1, 1, -1];
+const Q_FY: StaticArray<f64> = [1, 1, -1, -1];
+
+class Rect {
+    x0: f64;
+    y0: f64;
+    x1: f64;
+    y1: f64;
+    constructor(x0: f64, y0: f64, x1: f64, y1: f64) {
+        this.x0 = x0;
+        this.y0 = y0;
+        this.x1 = x1;
+        this.y1 = y1;
+    }
+    hits(o: Rect): bool {
+        return this.x0 < o.x1 && o.x0 < this.x1 && this.y0 < o.y1 && o.y0 < this.y1;
+    }
+}
+
+// one HUD vehicle tracker slot
+class Trk {
+    key: f64 = -1;
+    q: i32 = 0;
+    vis: f64 = 1;
+    lvis: f64 = 1;
+    x: f64 = -500;
+    y: f64 = -500;
+    s: f64 = 1;
+    op: f64 = 0;
+    hold: i32 = 0;
+    dPrev: f64 = -1;
+    vc: f64 = 0;
+    hexT: f64 = 0;
+    hex: string = "0x0000";
+    id: string = "HX-0000";
+    cl: string = "SEDAN";
+}
+
+class TrkCand {
+    d: f64;
+    key: f64;
+    p: Vector;
+    constructor(d: f64, key: f64, p: Vector) {
+        this.d = d;
+        this.key = key;
+        this.p = p;
+    }
+}
+
+const TRK_CLASSES: StaticArray<string> = ["SEDAN", "COURIER", "CARGO", "PATROL", "TAXI", "SHUTTLE", "FREIGHT", "MEDEVAC"];
+const HEXD: string = "0123456789ABCDEF";
+
+function hex4(v: i32): string {
+    let s = "0x";
+    for (let i = 3; i >= 0; i--) {
+        let d = (v >> (i * 4)) & 15;
+        s += HEXD.charAt(d);
+    }
+    return s;
+}
+
+function fmt1(v: f64): string {
+    let i = <i32>Math.floor(Math.max(v, 0) * 10 + 0.5);
+    let w = i / 10;
+    let f = i % 10;
+    return (w < 10 ? "0" : "") + w.toString() + "." + f.toString();
+}
+
+// a decoded facade atlas waiting to be uploaded, one mip level per step
+class TexJob {
+    data: ArrayBuffer = new ArrayBuffer(0);
+    W: i32 = 0;
+    tex: GPUTexture? = null;
+    layer: u32 = 0;
+    mip: i32 = 0;
+    y: i32 = 0;
+    mips: i32 = 8;
+}
+
+// a queued window-map decode (tools/make_winmap.py)
+class WinDec {
+    data: ArrayBuffer;
+    dec: TexDecode;
+
+    constructor(data: ArrayBuffer, dec: TexDecode) {
+        this.data = data;
+        this.dec = dec;
+    }
+}
+
+// decodes one facade JPEG (mip-chain atlas) into a texture-array layer
+class TexDecode extends ImageDecodeListener {
+    world: World;
+    tex: GPUTexture;
+    layer: u32;
+
+    mips: i32 = TexInfo.mips;
+
+    constructor(world: World, tex: GPUTexture, layer: u32, mips: i32 = TexInfo.mips) {
+        super();
+        this.world = world;
+        this.tex = tex;
+        this.layer = layer;
+        this.mips = mips;
+    }
+
+    // runs inside the decode callback (own 200 ms watchdog): only keep the pixels. The uploads
+    // happen in advance(), one mip level per step under a frame budget (World.pumpTex), so a busy
+    // machine can't push this callback past the watchdog.
+    override onImageDecoded(image: DecodedImage): void {
+        let j = new TexJob();
+        j.data = image.data;
+        j.W = <i32>image.width;
+        j.tex = this.tex;
+        j.layer = this.layer;
+        j.mips = this.mips;
+        this.world.texJobs.push(j);
+    }
+
+    override onImageDecodeFailed(message: string): void {
+        this.world.log("tex decode failed: " + message);
+        this.world.texDecoded();
+    }
+}
+

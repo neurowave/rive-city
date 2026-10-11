@@ -1,0 +1,894 @@
+// ================================================================ World
+export class World extends Layout {
+    @input clusterUI: Artboard? = null;
+    @input consoleUI: Artboard? = null;
+    @input hubUI: Artboard? = null;
+    @input hudUI: Artboard? = null;
+    @input bbRocket: Artboard? = null;
+    @input bbRive: Artboard? = null;
+    @input bbKinetic: Artboard? = null;
+    @input bbLive: Artboard? = null;
+    @input bbArcade: Artboard? = null;
+    @input bbHotel: Artboard? = null;
+    @input bbKoi: Artboard? = null;
+    @input bbAura: Artboard? = null;
+    @input bbDeep: Artboard? = null;
+    @input bbSilly: Artboard? = null;
+
+    context: Context? = null;
+    city: Pack? = null;
+    props: Pack? = null;
+    objs: Array<Obj> = [];
+    surfs: Array<Surf> = [];
+    bbs: Array<BB> = [];
+    npcs: Array<Npc> = [];
+    ext: Array<Obj> = [];
+    cab: Array<Obj> = [];
+    clFace: Obj? = null;
+    csFace: Obj? = null;
+    hubFace: Obj? = null;
+    yokeParts: Array<Obj> = [];
+    clParts: Array<Obj> = [];
+    csParts: Array<Obj> = [];
+    hudObj: Obj? = null;
+    glassObj: Obj? = null;
+    ambObj: Obj? = null;
+    extGlass: Obj? = null;
+    dseat: Array<Obj> = [];
+    orbitA: f64 = 0.6;
+    orbitBlend: f64 = 0;
+    vlim: StaticArray<f64> = new StaticArray<f64>(0);
+
+    // GPU
+    gpu: GPUCanvas? = null;
+    bgl: GPUBindGroupLayout? = null;
+    frameMain: GPUBuffer? = null;
+    frameRefl: GPUBuffer? = null;
+    frameCab: GPUBuffer? = null;
+    frameShadow: GPUBuffer? = null;
+    dummyUbo: GPUBuffer? = null;
+    litMS: GPUPipeline? = null;
+    litMSCull: GPUPipeline? = null;
+    litR: GPUPipeline? = null;
+    depthMS: GPUPipeline? = null;
+    skyMS: GPUPipeline? = null;
+    skyR: GPUPipeline? = null;
+    rainMS: GPUPipeline? = null;
+    holoMS: GPUPipeline? = null;     // holo blade signs (lit.wgsl vs_holo)
+    holoBuf: GPUBuffer? = null;
+    holoN: u32 = 0;
+    steamMS: GPUPipeline? = null;    // rooftop / street steam (lit.wgsl vs_steam)
+    steamBuf: GPUBuffer? = null;
+    steamN: u32 = 0;
+    glassMS: GPUPipeline? = null;
+    swarmPipe: GPUPipeline? = null;
+    greebleMS: GPUPipeline? = null;
+    greebleShadow: GPUPipeline? = null;
+    coneMS: GPUPipeline? = null;
+    shadowSkyBG: GPUBindGroup? = null;
+    conesObj: Obj? = null;
+    shadowPipe: GPUPipeline? = null;
+    brightPipe: GPUPipeline? = null;
+    blurPipe: GPUPipeline? = null;
+    finalPipe: GPUPipeline? = null;
+    hdrMSV: GPUTextureView? = null;
+    hdrV: GPUTextureView? = null;
+    depthMSV: GPUTextureView? = null;
+    reflV: GPUTextureView? = null;
+    reflDepthV: GPUTextureView? = null;
+    dummyV: GPUTextureView? = null;
+    albV: GPUTextureView? = null;
+    nrmV: GPUTextureView? = null;
+    shadowV: GPUTextureView? = null;
+    shadowAttV: GPUTextureView? = null;
+    shadowDummyV: GPUTextureView? = null;
+    clearPipe: GPUPipeline? = null;
+    frameCarShadow: GPUBuffer? = null;
+    carVP: Mat4 = Mat4.identity();      // relative to carOrigin
+    carOrigin: Vector = V(0, 0, 0);
+    viewProjRel: Mat4 = Mat4.identity(); // camera-relative (origin = eye) for the GPU
+    viewProjBRel: Mat4 = Mat4.identity();
+    viewProjRelNJ: Mat4 = Mat4.identity(); // unjittered (TAA reprojection)
+    prevVPRel: Mat4 = Mat4.identity();
+    prevEye: Vector = V(0, 0, 0);
+    jitN: i32 = 0;
+    taaPipe: GPUPipeline? = null;
+    hudMS: GPUPipeline? = null;
+    holoBackMS: GPUPipeline? = null;
+    holoBacks: Array<Obj> = [];
+    taaUbo: GPUBuffer? = null;
+    taaV: Array<GPUTextureView> = [];
+    taaBG: Array<GPUBindGroup> = [];
+    finBGs: Array<GPUBindGroup> = [];
+    taaIdx: i32 = 0;
+    trks: Array<Trk> = [new Trk(), new Trk(), new Trk(), new Trk()];
+    swCpu: StaticArray<f32> = new StaticArray<f32>(0);
+    gpuStage: i32 = 0;
+    taaValid: bool = false;
+    carShOn: bool = false;
+    envV: GPUTextureView? = null;
+    envUbo: GPUBuffer? = null;
+    envBG: GPUBindGroup? = null;
+    envFrames: i32 = 0;
+    albTex: GPUTexture? = null;
+    nrmTex: GPUTexture? = null;
+    texPending: i32 = 0;
+    texReady: bool = false;
+    texSampler: GPUSampler? = null;
+    linSampler: GPUSampler? = null;
+    swarmBuf: GPUBuffer? = null;
+    swarmN: u32 = 0;
+    texJobs: Array<TexJob> = [];
+    winQ: Array<WinDec> = [];        // window-map PNGs waiting to be decoded (one per frame)   // facade atlases waiting for upload (pumpTex)
+    carChunk: Chunk = new Chunk();   // car bounds for the cockpit-screen visibility test
+    dbgNoCull: bool = false;     // --data=dbgFlags=1: render every billboard canvas (A/B)
+    bbObjs: Array<Obj> = [];      // billboard design d -> its mesh object (surface 5 + d)
+    // quality (HIGH / MED / LOW): dynamic-resolution range, mirror resolution, swarm share
+    dynMin: f64 = 1.0;
+    dynMax: f64 = 2.0;
+    reflDiv: f64 = 3;
+    swarmFrac: f64 = 1;
+    b1V: GPUTextureView? = null;
+    b1tV: GPUTextureView? = null;
+    b2V: GPUTextureView? = null;
+    b2tV: GPUTextureView? = null;
+    b3V: GPUTextureView? = null;
+    b3tV: GPUTextureView? = null;
+    skyBG: GPUBindGroup? = null;
+    skyRBG: GPUBindGroup? = null;
+    downUbos: Array<GPUBuffer> = [];
+    downBGs: Array<GPUBindGroup> = [];
+    blUbos: Array<GPUBuffer> = [];
+    blBGs: Array<GPUBindGroup> = [];
+    finUbo: GPUBuffer? = null;
+    sunU: f64 = 0.5;
+    sunV: f64 = -1;
+    shaftPipe: GPUPipeline? = null;   // screen-space sun shafts (shafts.wgsl), quarter res
+    shaftUbo: GPUBuffer? = null;
+    shaftV: GPUTextureView? = null;
+    shaftBG: GPUBindGroup? = null;
+    finBG: GPUBindGroup? = null;
+    shadowVP: Mat4 = Mat4.identity();
+    lights: Array<Light> = [];
+    rain: f64 = 1;
+    scratch: ArrayBuffer = new ArrayBuffer(2048);
+    gpuReady: bool = false;
+    needsResize: bool = false;
+    hostScale: f64 = 1;
+    sizeX: f64 = 0;
+    sizeY: f64 = 0;
+    outScale: f64 = 1;
+    gScale: f64 = 1.25;
+    dynScale: f64 = 1.5; // dynamic resolution (fill-rate bound): 1.0 .. 1.5
+    dynT: f64 = 0;
+    dynN: i32 = 0;
+    dynHold: f64 = 0;
+    gw: i32 = 4;
+    gh: i32 = 4;
+    rw: i32 = 2;
+    rh: i32 = 2;
+    b1w: i32 = 2;
+    b1h: i32 = 2;
+    b2w: i32 = 2;
+    b2h: i32 = 2;
+    b3w: i32 = 2;
+    b3h: i32 = 2;
+
+    // clocks / state
+    time: f64 = 0;
+    boot: f64 = 0;
+    // title screen
+    entered: bool = false;
+    tt: f64 = 0;          // title clock (since load / replay)
+    loadT: f64 = -1;      // since the city finished loading (-1: still loading)
+    enterT: f64 = -1;     // since ENTER
+    enterOp: f64 = 0;
+    worldOp: f64 = 0;
+    tmx: f64 = 0;
+    tmy: f64 = 0;
+    tmxT: f64 = 0;
+    tmyT: f64 = 0;
+    tiltRoll: f64 = 0;
+    titleK: f64 = 1;
+    // title holo (camera-attached drum + rings wearing the "Title FUI" artboard)
+    holo: Array<Obj> = [];
+    holoOn: bool = false;
+    holoYaw: f64 = 0;
+    holoCued: bool = false;
+    nightT: f64 = 0;
+    night: f64 = 0;
+    riseR: f64 = 0;
+    powerR: f64 = 0;
+    origin: Vector = V(0, 0, 0);
+
+    // player
+    px: f64 = 0;
+    pz: f64 = 0;
+    yaw: f64 = 0;
+    v: f64 = 0;
+    alt: f64 = 62;
+    altV: f64 = 0;
+    altT: f64 = 62;
+    steer: f64 = 0;
+    yawRate: f64 = 0;
+    accel: f64 = 0;
+    roll: f64 = 0;
+    pitch: f64 = 0;
+    apS: f64 = 0;
+    autopilot: bool = true;
+    mode: i32 = 0;
+    battery: f64 = 86;
+    bump: f64 = 0;
+    carModel: Mat4 = Mat4.identity();
+    carPos: Vector = V(0, 0, 0);
+    carFwd: Vector = V(0, 0, -1);
+    keys: StaticArray<bool> = new StaticArray<bool>(512);
+    spring: Spring = new Spring();
+
+    // media / ui state
+    track: i32 = 2;
+    playing: bool = true;
+    progress: f64 = 0;
+    ambient: i32 = 0;
+    ambC: Col = hex(0xFFA41C);
+    taps: i32 = 1287;
+    hitT: f64 = 0;
+    camMode: i32 = 0; // 0 cockpit, 1 chase
+    camBlend: f64 = 0;
+    hudOn: bool = true;
+
+    // camera
+    eye: Vector = V(0, 10, 10);
+    target: Vector = V(0, 0, 0);
+    up: Vector = V(0, 1, 0);
+    view: Mat4 = Mat4.identity();
+    viewProj: Mat4 = Mat4.identity();
+    viewProjB: Mat4 = Mat4.identity();
+    invVP: Mat4 = Mat4.identity();
+    camF: Vector = V(0, 0, -1);
+    camR: Vector = V(1, 0, 0);
+    camU: Vector = V(0, 1, 0);
+    camAspect: f64 = 1.7778;
+    fov: f64 = 1;
+    inside: bool = false;
+    camSpeed: f64 = 0;
+    lastEye: Vector = V(0, 0, 0);
+    chaseYaw: f64 = 0;
+    chaseV: f64 = 0;
+    headYaw: f64 = 0;
+    headPitch: f64 = 0;
+    headVel: f64 = 0;
+    releaseT: f64 = 0;
+    markers: Array<Marker> = [new Marker(), new Marker(), new Marker()];
+
+    // pointer
+    down: bool = false;
+    dragging: bool = false;
+    downPos: Vector = V(0, 0, 0);
+    lastPos: Vector = V(0, 0, 0);
+    pressSurf: i32 = 0;
+    hoverSurf: i32 = 0;
+
+    // view model
+    pNum: Map<string, PropertyNumber> = new Map<string, PropertyNumber>();
+    pStr: Map<string, PropertyString> = new Map<string, PropertyString>();
+    missing: Map<string, bool> = new Map<string, bool>();
+    cNum: Map<string, f64> = new Map<string, f64>();
+    cStr: Map<string, string> = new Map<string, string>();
+    cLogo: Map<string, bool> = new Map<string, bool>();
+
+    log(msg: string): void {
+        let c = this.context;
+        if (c != null) {
+            c.log(msg);
+        }
+    }
+
+    // ------------------------------------------------------------ view model
+    private numProp(name: string): PropertyNumber? {
+        if (this.pNum.has(name)) {
+            return this.pNum.get(name);
+        }
+        if (this.missing.has("n:" + name)) {
+            return null;
+        }
+        let ctx = this.context;
+        if (ctx == null) {
+            return null;
+        }
+        let vm = ctx.rootViewModel();
+        if (vm == null) {
+            return null;
+        }
+        let q = vm.getNumber(name);
+        if (q == null) {
+            this.log("world: missing view-model number " + name);
+            this.missing.set("n:" + name, true);
+            return null;
+        }
+        this.pNum.set(name, q);
+        return q;
+    }
+
+    private strProp(name: string): PropertyString? {
+        if (this.pStr.has(name)) {
+            return this.pStr.get(name);
+        }
+        if (this.missing.has("s:" + name)) {
+            return null;
+        }
+        let ctx = this.context;
+        if (ctx == null) {
+            return null;
+        }
+        let vm = ctx.rootViewModel();
+        if (vm == null) {
+            return null;
+        }
+        let q = vm.getString(name);
+        if (q == null) {
+            this.log("world: missing view-model string " + name);
+            this.missing.set("s:" + name, true);
+            return null;
+        }
+        this.pStr.set(name, q);
+        return q;
+    }
+
+    setN(name: string, v: f64): void {
+        if (this.cNum.has(name) && Math.abs(this.cNum.get(name) - v) < 1e-4) {
+            return;
+        }
+        let p = this.numProp(name);
+        if (p != null) {
+            p.value = v;
+            this.cNum.set(name, v);
+        }
+    }
+
+    setS(name: string, v: string): void {
+        if (this.cStr.has(name) && this.cStr.get(name) == v) {
+            return;
+        }
+        let p = this.strProp(name);
+        if (p != null) {
+            p.value = v;
+            this.cStr.set(name, v);
+        }
+    }
+
+    getN(name: string): f64 {
+        let p = this.numProp(name);
+        return p != null ? p.value : 0;
+    }
+
+    setLogo(name: string, on: bool): void {
+        if (this.cLogo.has(name) && this.cLogo.get(name) == on) {
+            return;
+        }
+        let ctx = this.context;
+        if (ctx == null) {
+            return;
+        }
+        let vm = ctx.rootViewModel();
+        if (vm == null) {
+            return;
+        }
+        let lp = vm.getViewModel(name);
+        if (lp == null) {
+            return;
+        }
+        let b = lp.value.getBoolean("showLogo");
+        if (b != null) {
+            b.value = on;
+            this.cLogo.set(name, on);
+        }
+    }
+
+    // ------------------------------------------------------------ objects
+    newObj(mesh: PackMesh?, mode: i32, day: u32, id: i32, pass: i32): Obj {
+        let o = new Obj();
+        o.mesh = mesh;
+        o.mode = mode;
+        o.id = id;
+        o.day = hex(day);
+        o.pass = pass;
+        o.refl = pass == 1;
+        if (mesh == null) {
+            o.visible = false;
+        }
+        this.objs.push(o);
+        return o;
+    }
+
+    private pm(name: string): PackMesh? {
+        let p = this.props;
+        return p != null ? p.get(name) : null;
+    }
+
+    private cm(name: string): PackMesh? {
+        let c = this.city;
+        return c != null ? c.get(name) : null;
+    }
+
+    private carMat(name: string, mat: f64, day: u32, id: i32, pass: i32): Obj {
+        let o = this.newObj(this.pm(name), 14, day, id, pass);
+        o.fx[3] = mat;
+        o.rough = 0.5;
+        return o;
+    }
+
+    // sculpted hovercar parts (tools/make_car.py); prefix "car_" (player, hi-res) or "npc_"
+    carParts(prefix: string, paintDay: u32, idBase: i32, thrust: Col, player: bool): Array<Obj> {
+        let paint = this.carMat(prefix + "paint", MAT_PAINT, paintDay, idBase, 1);
+        let black = this.carMat(prefix + "black", MAT_BLACK, 0x050505, idBase + 2, 1);
+        let carbon = this.carMat(prefix + "carbon", MAT_CARBON, 0x0A0A0A, idBase + 2, 1);
+        let metal = this.carMat(prefix + "metal", MAT_METAL, 0xA0A0A4, idBase + 2, 1);
+        let glass: Obj;
+        if (player) {
+            glass = this.newObj(this.pm(prefix + "glass"), 22, 0x000000, idBase + 1, 1);
+            glass.glass = true;
+            glass.refl = false;
+        } else {
+            glass = this.carMat(prefix + "glass", MAT_GLASS, 0x020203, idBase + 1, 1);
+        }
+        let light = this.newObj(this.pm(prefix + "light"), 5, 0xF4F1EA, idBase, 1);
+        light.emis = 4.5;
+        let tail = this.newObj(this.pm(prefix + "tail"), 5, 0xFF2A18, idBase, 1);
+        tail.emis = player ? 6.0 : 4.0;
+        let accent = this.newObj(this.pm(prefix + "accent"), 5, 0xFFA41C, idBase, 1);
+        accent.emis = 2.2;
+        let th = this.newObj(this.pm(prefix + "thrust"), 12, 0xFFA41C, idBase, 1);
+        th.accent = thrust;
+        let parts = [paint, black, carbon, metal, glass, light, tail, accent, th];
+        for (let i = 0; i < 4; i++) {
+            parts[i].envMap = true;
+            parts[i].castCar = player;
+        }
+        glass.envMap = true;
+        return parts;
+    }
+
+    private newSurf(input: Artboard?, density: f64, clear: u32): Surf {
+        let s = new Surf();
+        s.input = input;
+        s.density = density;
+        s.clear = clear;
+        return s;
+    }
+
+    // the SillyScroll board and the route sample ~42 m in front of it where the car pulls up
+    // stop points for every playable board;
+    // the sillyC/sillyS fields hold the CURRENT target, re-picked while driving (pickPlayTarget)
+    private findSillyStop(): void {
+        for (let i = 0; i < this.bbs.length; i++) {
+            let b = this.bbs[i];
+            if (b.design != SILLY_DES) {
+                continue;
+            }
+            let best: f64 = 1e9;
+            let bestS: f64 = 0;
+            for (let s = 0; s < ROUTE_N; s++) {
+                let p = routeAt(<f64>s);
+                let dn = (<f64>p.x - <f64>b.c.x) * b.nx + (<f64>p.z - <f64>b.c.z) * b.nz;
+                if (dn < 20 || dn > 90) {
+                    continue;
+                }
+                let d = routeDir(<f64>s);
+                if (-(<f64>d.x * b.nx + <f64>d.z * b.nz) < 0.7) {
+                    continue;   // must be heading at the board
+                }
+                let sc = Math.abs(dn - 42);
+                if (sc < best) {
+                    best = sc;
+                    bestS = <f64>s;
+                }
+            }
+            this.log("world: play board " + BB_NAMES[b.design] + " at " + formatFixed(<f64>b.c.x, 1) + "," +
+                formatFixed(<f64>b.c.z, 1) + (best < 1e8 ? " stop s=" + formatFixed(bestS, 0) : " (no stop found)"));
+            if (best < 1e8) {
+                this.playBs.push(b);
+                this.playSs.push(bestS);
+                this.playDs.push(-1);
+            }
+        }
+        this.sillyOk = this.playBs.length > 0;
+        this.pickPlayTarget();
+    }
+
+    // how far the play camera can back off square-on from a board before a building gets in the way
+    // (march the board normal at its centre height through the collision grid; capped at 32 m)
+    private clearAhead(b: BB): f64 {
+        let y = <f64>b.c.y - 0.6;
+        let cb = this.collB;
+        for (let t: f64 = 2; t <= 34; t += 0.5) {
+            let x = <f64>b.c.x + b.nx * t;
+            let z = <f64>b.c.z + b.nz * t;
+            let gx = <i32>Math.floor((x - this.collX0) / this.collCS);
+            let gz = <i32>Math.floor((z - this.collZ0) / this.collCS);
+            if (gx < 0 || gz < 0 || gx >= this.collNX || gz >= this.collNZ) {
+                continue;
+            }
+            let c = gz * this.collNX + gx;
+            for (let k = this.collStart[c]; k < this.collStart[c + 1]; k++) {
+                let i = this.collItems[k] * 6;
+                if (x > <f64>cb[i] - 1 && x < <f64>cb[i + 3] + 1 && z > <f64>cb[i + 2] - 1 && z < <f64>cb[i + 5] + 1 &&
+                    y > <f64>cb[i + 1] && y < <f64>cb[i + 4]) {
+                    let d = Math.max(12, t - 1.5);
+                    this.log("world: play camera for " + BB_NAMES[b.design] + " limited to " + formatFixed(d, 1) + " m");
+                    return Math.min(32, d);
+                }
+            }
+        }
+        return 32;
+    }
+
+    // the play board whose stop is next ahead on the route (just-passed counts as here)
+    private pickPlayTarget(): void {
+        if (this.play != 0 || this.playBs.length == 0) {
+            return;
+        }
+        let bi = 0;
+        let bd: f64 = 1e9;
+        for (let i = 0; i < this.playBs.length; i++) {
+            let d = wrapS(this.playSs[i] - this.apS);
+            if (d > <f64>ROUTE_N - 6) {
+                d = 0;
+            }
+            if (d < bd) {
+                bd = d;
+                bi = i;
+            }
+        }
+        let b = this.playBs[bi];
+        if (this.playDs[bi] < 0 && this.collState == 4) {   // grid fully built (collStep)
+            this.playDs[bi] = this.clearAhead(b);
+        }
+        this.sillyD = this.playDs[bi] > 0 ? this.playDs[bi] : 32;
+        this.sillyC = b.c;
+        this.sillyNx = b.nx;
+        this.sillyNz = b.nz;
+        this.sillyS = this.playSs[bi];
+        this.playDes = b.design;
+    }
+
+    private speedLimits(): StaticArray<f64> {
+        let lim = new StaticArray<f64>(ROUTE_N);
+        for (let s = 0; s < ROUTE_N; s++) {
+            let a = routeDir(<f64>s - 5);
+            let b = routeDir(<f64>s + 5);
+            let ang = Math.acos(clamp(vdot(a, b), -1, 1));
+            let kappa = ang / 10;
+            lim[s] = kappa > 1e-4 ? Math.min(40, Math.sqrt(4.5 / kappa)) : 40;
+        }
+        for (let pass = 0; pass < 2; pass++) {
+            for (let s = ROUTE_N - 1; s >= 0; s--) {
+                let nxt = lim[(s + 1) % ROUTE_N];
+                lim[s] = Math.min(lim[s], Math.sqrt(nxt * nxt + 2 * 3.5));
+            }
+        }
+        return lim;
+    }
+
+    instanceSurfs(): void {
+        let ctx = this.context;
+        if (ctx == null) {
+            return;
+        }
+        for (let k = 0; k < this.surfs.length; k++) {
+            let sf = this.surfs[k];
+            let input = sf.input;
+            if (input == null) {
+                this.log("world: surface artboard " + (k + 1).toString() + " not bound");
+                continue;
+            }
+            let inst = input.instance(ctx.rootViewModel());
+            inst.frameOrigin = true;
+            sf.inst = inst;
+            sf.w = inst.width;
+            sf.h = inst.height;
+        }
+    }
+
+    // ------------------------------------------------------------ init
+    // Loading is staged over the first frames: each host callback has its own
+    // 200 ms watchdog, and copying the 35 MB city blob + 12 MB props blob plus
+    // building the scene in init() alone overruns it under load.
+    loadStage: i32 = 0;
+    // SillyScroll stop-and-play: 0 driving, 1 pulling up to the board, 2 stopped + playing
+    play: i32 = 0;
+    lookHome: bool = false;
+    titlePow: f64 = 0;
+    blackK: f64 = 1;
+    logoSeen: bool = false;   // the title logo has been allowed to show once          // start-up blackout (fades once the city has loaded)        // power radius on the night start screen (follows the city rise)   // ease the head-look back to centre (set when autopilot engages)
+    playK: f64 = 0;
+    sillyOk: bool = false;
+    playBs: Array<BB> = [];
+    playSs: Array<f64> = [];
+    playDes: i32 = SILLY_DES;
+    playDs: Array<f64> = [];   // clear camera distance in front of each play board (-1 = not yet measured)
+    sillyD: f64 = 32;
+    sillyC: Vector = V(0, 0, 0);
+    sillyNx: f64 = 0;
+    sillyNz: f64 = 1;
+    sillyS: f64 = 0;
+    zIn: ChunkedInflate? = null;
+    zT: f64 = 0;
+    cityP: Pack? = null;
+    propsP: Pack? = null;
+
+    override init(context: Context): bool {
+        this.context = context;
+        // surfaces: 0 cluster, 1 console, 2 hub, 3 hud, 4..12 billboards
+        let black: u32 = 0xFF060608;
+        let clearT: u32 = 0x00000000;
+        this.surfs = [
+            this.newSurf(this.clusterUI, 2.0, black),
+            this.newSurf(this.consoleUI, 1.6, black),
+            this.newSurf(this.hubUI, 2.0, black),
+            this.newSurf(this.hudUI, 1.15, clearT),
+            this.newSurf(this.bbRocket, 0.75, black),
+            this.newSurf(this.bbRive, 0.75, black),
+            this.newSurf(this.bbKinetic, 0.75, black),
+            this.newSurf(this.bbLive, 0.75, black),
+            this.newSurf(this.bbArcade, 0.75, black),
+            this.newSurf(this.bbHotel, 0.75, black),
+            this.newSurf(this.bbKoi, 0.75, black),
+            this.newSurf(this.bbAura, 0.75, black),
+            this.newSurf(this.bbDeep, 0.75, black),
+            this.newSurf(this.bbSilly, 1.0, black),     // full res: it fills the frame while you play
+        ];
+        this.instanceSurfs();
+        return true;
+    }
+
+    // returns true once the scene exists
+    private stageLoad(): bool {
+        if (this.loadStage >= 5) {
+            return true;
+        }
+        if (this.loadStage == 3) {
+            // collision grid, time-budgeted over as many frames as it takes
+            if (this.collStep()) {
+                this.loadStage = 5;
+            }
+            return false;
+        }
+        let ctx = this.context;
+        if (ctx == null) {
+            return false;
+        }
+        // stages 0/1: the mesh packs ship deflated (RZ01, tools/zpack.py); inflate them a few chunks per
+        // frame under a time budget, then parse the byte-identical pack
+        if (this.loadStage == 0 || this.loadStage == 1) {
+            let nm = this.loadStage == 0 ? "city" : "props";
+            if (this.zIn == null) {
+                let b = ctx.blob(nm);
+                if (b == null) {
+                    this.log("world: " + nm + " blob missing");
+                    return false;
+                }
+                let z = openZ(b);
+                if (z == null) {
+                    this.zDone(nm, b);  // stored raw
+                    return false;
+                }
+                this.zIn = z;
+                this.zT = clock();
+            }
+            let zi = this.zIn!;
+            if (!zi.step(0.022)) {
+                return false;
+            }
+            this.zIn = null;
+            if (zi.failed) {
+                this.log("world: " + nm + " inflate failed at chunk " + zi.k.toString());
+                return false;
+            }
+            this.log("load: inflate " + nm + " " + zi.out.byteLength.toString() + " bytes in " + ((clock() - this.zT) * 1000).toString() + " ms");
+            this.zDone(nm, zi.out);
+            return false;
+        }
+        if (this.cityP == null || this.propsP == null) {
+            this.log("world: bad mesh pack");
+            return false;
+        }
+        this.props = this.propsP;
+        this.city = this.cityP;
+        this.setupScene();
+        this.loadStage = 3;
+        return false; // collision, then GPU setup, on the next frames
+    }
+
+    private zDone(nm: string, b: ArrayBuffer): void {
+        if (nm == "city") {
+            this.cityP = loadPack(b);
+            this.loadStage = 1;
+        } else {
+            this.propsP = loadPack(b);
+            this.loadStage = 2;
+        }
+    }
+
+    private setupScene(): void {
+
+        // city
+        this.newObj(this.cm("ground"), 4, 0x9A9DA2, 1, 1);
+        let roads = this.newObj(this.cm("roads"), 3, 0x6E7177, 2, 1);
+        roads.accent = hex(0xFFA41C);
+        this.newObj(this.cm("marks"), 13, 0x8A8C90, 2, 1);
+        this.newObj(this.cm("walks"), 4, 0xA9ACB0, 3, 1);
+        this.newObj(this.cm("buildings"), 2, 0xB4B7BD, 4, 1);
+        this.newObj(this.cm("far"), 2, 0xA9AEB5, 5, 1);
+        this.newObj(this.cm("neon"), 8, 0x8E9097, 6, 1);
+        this.newObj(this.cm("beacons"), 8, 0x8E9097, 6, 1);
+        let lamps = this.newObj(this.cm("lamps"), 0, 0x3A3C40, 7, 1);
+        lamps.rough = 0.4;
+        lamps.metal = 0.6;
+        this.newObj(this.cm("lampglow"), 8, 0x8E9097, 7, 1);
+        this.newObj(this.cm("gates"), 8, 0x8E9097, 8, 1);
+        let cables = this.newObj(this.cm("cables"), 0, 0x1B1C20, 9, 1);
+        cables.noRefl = true;
+        cables.rough = 0.55;
+        cables.metal = 0.3;
+        let cones = this.newObj(this.cm("cones"), 16, 0xFFFFFF, 20, 1);
+        cones.refl = false;
+        this.conesObj = cones;
+        let gantry = this.newObj(this.cm("gantry"), 0, 0x2A2C30, 9, 1);
+        gantry.rough = 0.45;
+        gantry.metal = 0.5;
+        let bbframe = this.newObj(this.cm("bbframe"), 0, 0x1A1B1E, 10, 1);
+        bbframe.rough = 0.5;
+        bbframe.metal = 0.4;
+        for (let d = 0; d < N_DES; d++) {
+            let o = this.newObj(this.cm("bb" + d.toString()), 10, 0x101012, 11 + d, 1);
+            o.tex = 5 + d;
+            this.bbObjs.push(o);
+        }
+        // (title visor removed: the curved visor treatment now lives on the in-car HUD)
+
+        // billboards (picking + AR markers)
+        for (let i = 0; i < City.bbN; i++) {
+            let o = i * 8;
+            let b = new BB();
+            b.c = V(<f64>City.bb[o], <f64>City.bb[o + 1], <f64>City.bb[o + 2]);
+            b.nx = <f64>City.bb[o + 3];
+            b.nz = <f64>City.bb[o + 4];
+            b.rx = b.nz;
+            b.rz = -b.nx;
+            b.w = <f64>City.bb[o + 5];
+            b.h = <f64>City.bb[o + 6];
+            b.design = <i32>City.bb[o + 7];
+            this.bbs.push(b);
+        }
+        this.vlim = this.speedLimits();
+        this.findSillyStop();
+
+        // player exterior (back-face culled so the cabin sees out through it)
+        let ext = this.carParts("car_", 0x17181C, 30, hex(0xFFA41C), true);   // dark graphite: the light bar pops
+        for (let i = 0; i < ext.length; i++) {
+            ext[i].ext = true;
+            ext[i].cull = true;
+        }
+        this.ext = ext;
+        this.extGlass = ext[4];
+
+        // traffic (a few hero cars near the route; the swarm is instanced)
+        for (let i = 1; i <= 4; i++) {
+            this.addNpc(1, START_S + 60 + <f64>i * 230, 14 + <f64>i, 4.5, 0, 0, 0.55, 1, 1);
+        }
+        for (let i = 1; i <= 6; i++) {
+            this.addNpc(2, START_S + 40 + <f64>i * 300, 15 + <f64>(i % 3) * 2, -4.5 - <f64>(i % 2) * 4.5, 0, 0, 0.55, -1, 1);
+        }
+        let alts: StaticArray<f64> = [13, 26, 41, 58];
+        for (let i = 1; i <= 26; i++) {
+            let axis = i % 2;
+            let line = <f64>((i * 3) % (NB + 1)) * P + (i % 4 < 2 ? 4 : -4);
+            let alt = alts[i % 4] + <f64>((i * 7) % 5) * 0.6;
+            let dir: f64 = ((i / 2) % 2) == 0 ? 1 : -1;
+            this.addNpc(3, <f64>((i * 137) % 1000) - 150, 22 + <f64>(i % 5) * 4, 0, axis, line, alt, dir, i % 7 == 0 ? 1.9 : 1);
+        }
+
+        // cockpit (sculpted, tools/make_car.py)
+        this.cabMat("cab_leather", MAT_LEATHER, 0x2B2826);
+        this.cabMat("cab_leather2", MAT_QUILT, 0x8A4824);
+        this.cabMat("cab_suede", MAT_SUEDE, 0x34343A);
+        this.cabMat("cab_soft", MAT_SOFT, 0x46413C);
+        this.cabMat("cab_carbon", MAT_CARBON, 0x0A0A0A);
+        this.cabMat("cab_metal", MAT_METAL, 0xA0A0A4);
+        this.cabMat("cab_black", MAT_BLACK, 0x050505);
+        this.cabMat("cab_grille", MAT_GRILLE, 0x101010);
+        this.cabMat("cab_carpet", MAT_CARPET, 0x2C2C2F);
+        this.cabMat("cab_tan", MAT_LEATHER, 0x8A4824);
+        // driver's seat dissolves with the canopy as the intro camera flies in
+        let ds1 = this.cabMat("dseat_leather", MAT_LEATHER, 0x2B2826);
+        let ds2 = this.cabMat("dseat_leather2", MAT_QUILT, 0x8A4824);
+        this.dseat = [ds1, ds2];
+        let puck = this.cabObj("cab_puck", 9, 0x303236, 2);
+        puck.fx[1] = 1;
+        this.ambObj = this.cabObj("cab_amb", 9, 0x2A2B30, 2);
+        // driver display
+        let clBody = this.cabMat("cl_black", MAT_BLACK, 0x050505);
+        let clTrim = this.cabMat("cl_metal", MAT_METAL, 0xA0A0A4);
+        let clFace = this.cabObj("cl_face", 1, 0x060608, 2);
+        clFace.tex = 1;
+        this.clFace = clFace;
+        this.clParts = [clBody, clTrim, clFace];
+        // centre screen
+        let csBody = this.cabMat("cs_black", MAT_BLACK, 0x050505);
+        let csTrim = this.cabMat("cs_metal", MAT_METAL, 0xA0A0A4);
+        let csFace = this.cabObj("cs_face", 1, 0x060608, 2);
+        csFace.tex = 2;
+        this.csFace = csFace;
+        this.csParts = [csBody, csTrim, csFace];
+        // yoke + hub
+        let y1 = this.cabMat("yk_carbon", MAT_CARBON, 0x0A0A0A);
+        let y2 = this.cabMat("yk_suede", MAT_SUEDE, 0x2C2C31);
+        let y3 = this.cabMat("yk_leather", MAT_LEATHER, 0x2B2826);
+        let y4 = this.cabMat("yk_black", MAT_BLACK, 0x050505);
+        let y5 = this.cabMat("yk_metal", MAT_METAL, 0xA0A0A4);
+        let y6 = this.cabMat("yk_tan", MAT_LEATHER, 0x8A4824);
+        let hubF = this.cabObj("hub_face", 1, 0x060608, 2);
+        hubF.tex = 3;
+        this.hubFace = hubF;
+        this.yokeParts = [y1, y2, y3, y4, y5, y6, hubF];
+        // glass: HUD + windshield tint
+        let hud = this.cabObj("hud", 20, 0, 3);
+        hud.tex = 4;
+        hud.accent = hex(0xFFA41C);
+        this.hudObj = hud;
+        this.glassObj = this.cabObj("wglass", 21, 0, 3);
+
+        // start pose
+        this.resetPose();
+        let bld = this.cm("buildings");
+        this.log("world: city " + (bld != null ? (bld.count / 3).toString() : "0") + " tris, " + this.objs.length.toString() +
+            " objects, " + this.bbs.length.toString() + " billboards, route " + ROUTE_N.toString() + " m (AnimaScript)");
+    }
+
+    private cabId: i32 = COCKPIT_ID;
+
+    private cabObj(mesh: string, mode: i32, day: u32, pass: i32): Obj {
+        this.cabId++;
+        let o = this.newObj(this.pm(mesh), mode, day, this.cabId, pass);
+        o.rough = 0.62;
+        this.cab.push(o);
+        return o;
+    }
+
+    private cabMat(mesh: string, mat: f64, day: u32): Obj {
+        let o = this.cabObj(mesh, 14, day, 2);
+        o.fx[3] = mat;
+        o.castCar = true;
+        o.auxW = 2; // interior: cabin fill light
+        return o;
+    }
+
+    private addNpc(kind: i32, s: f64, v: f64, off: f64, axis: i32, line: f64, alt: f64, dir: f64, scale: f64): void {
+        let k = this.npcs.length + 1;
+        let pc = NPC_PAINT[(k % 6) * 2];
+        let thr = k % 3 == 0 ? hex(0x19F2FF) : (k % 3 == 1 ? hex(0xFFA41C) : hex(0xF30058));
+        let n = new Npc();
+        n.kind = kind;
+        n.s = s;
+        n.v = v;
+        n.off = off;
+        n.axis = axis;
+        n.line = line;
+        n.alt = alt;
+        n.dir = dir;
+        n.scale = scale;
+        n.parts = this.carParts("npc_", pc, 40 + (k % 40) * 3, thr, false);
+        this.npcs.push(n);
+    }
+
+    resetPose(): void {
+        let p = routeAt(START_S);
+        let f = routeDir(START_S);
+        this.px = <f64>p.x;
+        this.pz = <f64>p.z;
+        this.yaw = yawOf(<f64>f.x, <f64>f.z);
+        this.apS = START_S;
+        this.origin = V(<f64>p.x, 0, <f64>p.z);
+    }
+

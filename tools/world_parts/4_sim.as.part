@@ -1,0 +1,1566 @@
+    // ------------------------------------------------------------ driving
+    private nearestS(x: f64, z: f64): f64 {
+        let best = this.apS;
+        let bd: f64 = 1e18;
+        for (let d = -40; d <= 60; d++) {
+            let s = wrapS(Math.floor(this.apS) + <f64>d);
+            let r = routeAt(s);
+            let dd = (<f64>r.x - x) * (<f64>r.x - x) + (<f64>r.z - z) * (<f64>r.z - z);
+            if (dd < bd) {
+                bd = dd;
+                best = s;
+            }
+        }
+        if (bd > 900) {
+            // far off route (manual driving): global search
+            for (let s = 0; s < ROUTE_N; s += 3) {
+                let r = routeAt(<f64>s);
+                let dd = (<f64>r.x - x) * (<f64>r.x - x) + (<f64>r.z - z) * (<f64>r.z - z);
+                if (dd < bd) {
+                    bd = dd;
+                    best = <f64>s;
+                }
+            }
+        }
+        return best;
+    }
+
+    // ---- building collision: boxes from tools/make_city.py (coll_inst), bucketed in a grid
+    collB: StaticArray<f32> = new StaticArray<f32>(0);
+    collStart: StaticArray<i32> = new StaticArray<i32>(0);
+    collItems: StaticArray<i32> = new StaticArray<i32>(0);
+    collNX: i32 = 0;
+    collNZ: i32 = 0;
+    collX0: f64 = 0;
+    collZ0: f64 = 0;
+    collCS: f64 = 24;
+
+    private collCnt: StaticArray<i32> = new StaticArray<i32>(1);
+    private collState: i32 = 0;
+    private collI: i32 = 0;
+    private collN: i32 = 0;
+
+    // incremental under a per-frame time budget: the host watchdog is 200 ms per
+    // callback and a loaded machine (editors open) runs this 5-8x slower
+    collStep(): bool {
+        let t0 = clock();
+        let budget = 0.03;
+        if (this.collState == 0) {
+            let m = this.cm("coll_inst");
+            if (m == null) {
+                this.log("world: no collision boxes");
+                this.collState = 3;
+                return true;
+            }
+            let n = <i32>m.vcount;
+            this.collN = n;
+            this.collB = new StaticArray<f32>(n * 6);
+            this.collX0 = -P - 60;
+            this.collZ0 = -P - 60;
+            let size = <f64>(NB + 2) * P + 120;
+            let nx = <i32>Math.ceil(size / this.collCS);
+            this.collNX = nx;
+            this.collNZ = nx;
+            this.collCnt = new StaticArray<i32>(nx * nx + 1);
+            this.collI = 0;
+            this.collState = 1;
+        }
+        if (this.collState == 1) {
+            let m = this.cm("coll_inst")!;
+            let src = m.src;
+            let b = this.collB;
+            while (this.collI < this.collN) {
+                let i = this.collI;
+                let o = <f64>m.vOff + <f64>i * 32;
+                for (let j = 0; j < 6; j++) {
+                    b[i * 6 + j] = <f32>Buffer.readf32(src, o + <f64>j * 4);
+                }
+                this.collI++;
+                if ((i & 255) == 0 && clock() - t0 > budget) {
+                    return false;
+                }
+            }
+            this.collI = 0;
+            this.collState = 2;
+        }
+        if (this.collState == 2) {
+            if (!this.collPassStep(0, t0, budget)) {
+                return false;
+            }
+            let nx = this.collNX;
+            let cnt = this.collCnt;
+            for (let c = 0; c < nx * nx; c++) {
+                cnt[c + 1] += cnt[c];
+            }
+            this.collStart = new StaticArray<i32>(nx * nx + 1);
+            for (let c = 0; c <= nx * nx; c++) {
+                this.collStart[c] = cnt[c];
+            }
+            this.collItems = new StaticArray<i32>(cnt[nx * nx]);
+            this.collI = 0;
+            this.collState = 3;
+        }
+        if (this.collState == 3) {
+            if (!this.collPassStep(1, t0, budget)) {
+                return false;
+            }
+            this.collState = 4;
+            this.log("world: collision " + this.collN.toString() + " boxes, " + this.collItems.length.toString() + " grid refs");
+        }
+        return true;
+    }
+
+    private collPassStep(pass: i32, t0: f64, budget: f64): bool {
+        let b = this.collB;
+        let n = this.collN;
+        let nx = this.collNX;
+        let cnt = this.collCnt;
+        while (this.collI < n) {
+            let i = this.collI;
+            let cx0 = <i32>Math.floor((<f64>b[i * 6] - 2 - this.collX0) / this.collCS);
+            let cx1 = <i32>Math.floor((<f64>b[i * 6 + 3] + 2 - this.collX0) / this.collCS);
+            let cz0 = <i32>Math.floor((<f64>b[i * 6 + 2] - 2 - this.collZ0) / this.collCS);
+            let cz1 = <i32>Math.floor((<f64>b[i * 6 + 5] + 2 - this.collZ0) / this.collCS);
+            cx0 = <i32>Math.max(0, cx0);
+            cz0 = <i32>Math.max(0, cz0);
+            cx1 = <i32>Math.min(nx - 1, cx1);
+            cz1 = <i32>Math.min(nx - 1, cz1);
+            for (let cz = cz0; cz <= cz1; cz++) {
+                for (let cx = cx0; cx <= cx1; cx++) {
+                    let c = cz * nx + cx;
+                    if (pass == 0) {
+                        cnt[c + 1] = cnt[c + 1] + 1;
+                    } else {
+                        this.collItems[cnt[c]] = i;
+                        cnt[c] = cnt[c] + 1;
+                    }
+                }
+            }
+            this.collI++;
+            if ((i & 255) == 0 && clock() - t0 > budget) {
+                return false;
+            }
+        }
+        this.collI = 0;
+        return true;
+    }
+
+    private collide(): void {
+        // hovercar vs buildings at the current altitude: push out, slide along walls
+        let r: f64 = 1.7;
+        let y0 = this.alt + 0.15;
+        let y1 = this.alt + 1.5;
+        let fx = Math.sin(this.yaw);
+        let fz = -Math.cos(this.yaw);
+        let hitNX: f64 = 0;
+        let hitNZ: f64 = 0;
+        let hits = 0;
+        if (this.collState == 4) {   // the grid is built over several frames (collStep)
+            for (let it = 0; it < 2; it++) {
+                let gx = <i32>Math.floor((this.px - this.collX0) / this.collCS);
+                let gz = <i32>Math.floor((this.pz - this.collZ0) / this.collCS);
+                if (gx < 0 || gz < 0 || gx >= this.collNX || gz >= this.collNZ) {
+                    break;
+                }
+                let c = gz * this.collNX + gx;
+                let b = this.collB;
+                for (let k = this.collStart[c]; k < this.collStart[c + 1]; k++) {
+                    let i = this.collItems[k] * 6;
+                    if (<f64>b[i + 4] < y0 || <f64>b[i + 1] > y1) {
+                        continue;
+                    }
+                    let bx0 = <f64>b[i] - 0.6;
+                    let bz0 = <f64>b[i + 2] - 0.6;
+                    let bx1 = <f64>b[i + 3] + 0.6;
+                    let bz1 = <f64>b[i + 5] + 0.6;
+                    let qx = clamp(this.px, bx0, bx1);
+                    let qz = clamp(this.pz, bz0, bz1);
+                    let dx = this.px - qx;
+                    let dz = this.pz - qz;
+                    let d2 = dx * dx + dz * dz;
+                    if (d2 >= r * r) {
+                        continue;
+                    }
+                    let nx: f64 = 0;
+                    let nz: f64 = 0;
+                    let pen: f64 = 0;
+                    if (d2 < 1e-8) {
+                        // centre inside the box: leave by the nearest face
+                        let l = this.px - bx0;
+                        let rr = bx1 - this.px;
+                        let tt = this.pz - bz0;
+                        let bb = bz1 - this.pz;
+                        let mn = Math.min(Math.min(l, rr), Math.min(tt, bb));
+                        if (mn == l) {
+                            nx = -1;
+                        } else if (mn == rr) {
+                            nx = 1;
+                        } else if (mn == tt) {
+                            nz = -1;
+                        } else {
+                            nz = 1;
+                        }
+                        pen = mn + r;
+                    } else {
+                        let d = Math.sqrt(d2);
+                        nx = dx / d;
+                        nz = dz / d;
+                        pen = r - d;
+                    }
+                    this.px += nx * pen;
+                    this.pz += nz * pen;
+                    hitNX += nx;
+                    hitNZ += nz;
+                    hits++;
+                }
+            }
+        }
+        if (hits > 0) {
+            let l = Math.sqrt(hitNX * hitNX + hitNZ * hitNZ);
+            if (l > 1e-6) {
+                let nx = hitNX / l;
+                let nz = hitNZ / l;
+                let into = -(fx * nx + fz * nz); // 1 = head-on
+                if (into > 0) {
+                    if (into > 0.75 && this.v > 7) {
+                        this.bump = 1;
+                    }
+                    this.v *= 1 - 0.5 * into * into * into;
+                    // turn along the wall so the car slides instead of sticking
+                    let tx = -nz;
+                    let tz = nx;
+                    if (tx * fx + tz * fz < 0) {
+                        tx = -tx;
+                        tz = -tz;
+                    }
+                    let want = yawOf(tx, tz);
+                    this.yaw = wrapAng(this.yaw + wrapAng(want - this.yaw) * 0.3 * into);
+                }
+            }
+        }
+        this.px = clamp(this.px, -P + 2, <f64>NB * P + P - 2);
+        this.pz = clamp(this.pz, -P + 2, <f64>NB * P + P - 2);
+    }
+
+    // route distance (m) still to go to the SillyScroll stop; just-passed counts as 0
+    private sillyAhead(): f64 {
+        let d = wrapS(this.sillyS - this.apS);
+        return d > <f64>ROUTE_N - 6 ? 0 : d;
+    }
+
+    // render quality: 0 HIGH (default), 1 MED, 2 LOW
+    quality: i32 = 0;
+
+    private setQuality(q: i32): void {
+        this.quality = q;
+        this.setN("qs0", q == 0 ? 1 : 0);
+        this.setN("qs1", q == 1 ? 1 : 0);
+        this.setN("qs2", q == 2 ? 1 : 0);
+        this.applyQuality();
+    }
+
+    private applyQuality(): void {
+        let q = this.quality;
+        this.dynMin = q == 0 ? 1.0 : (q == 1 ? 0.85 : 0.7);
+        this.dynMax = q == 0 ? 2.0 : (q == 1 ? 1.5 : 1.0);
+        this.reflDiv = q == 0 ? 3 : (q == 1 ? 4 : 5);
+        this.swarmFrac = q == 2 ? 0.6 : 1;
+        this.dynScale = clamp(this.dynScale, this.dynMin, this.dynMax);
+        this.needsResize = true;
+    }
+
+    private setAutopilot(on: bool): void {
+        if (on && !this.autopilot) {
+            this.lookHome = true;
+        }
+        this.autopilot = on;
+    }
+
+    private togglePlay(): void {
+        if (!this.sillyOk || !this.entered) {
+            return;
+        }
+        if (this.play > 0) {
+            this.play = 0;
+            this.setAutopilot(true);
+            return;
+        }
+        this.play = 1;
+        this.setAutopilot(true);
+    }
+
+    private drive(dt: f64): void {
+        let k = this.keys;
+        let up = k[KEY_UP] || k[KEY_W];
+        let dn = k[KEY_DOWN] || k[KEY_S];
+        let lf = k[KEY_LEFT] || k[KEY_A];
+        let rt = k[KEY_RIGHT] || k[KEY_D];
+        if ((up || dn || lf || rt) && this.play > 0) {
+            this.play = 0;      // steering leaves the board and hands the car back
+        }
+        if ((up || dn || lf || rt) && this.autopilot && this.boot >= T_GO) {
+            this.autopilot = false;
+        }
+        let go = this.boot >= T_GO;
+        let a: f64 = 0;
+        let yawRateT: f64 = 0;
+        this.apS = this.nearestS(this.px, this.pz);
+        let maxRate = Math.min(1.25, (this.v + 0.5) / 6.5);
+        let cruise = MODE_CRUISE[this.mode];
+        let accelMax = MODE_ACCEL[this.mode];
+        if (this.play > 0 && !this.autopilot) {
+            this.autopilot = true;
+        }
+        if (this.autopilot) {
+            let tgt: f64 = 0;
+            if (go) {
+                tgt = cruise / KMH;
+                let look = <i32>Math.floor(wrapS(this.apS + this.v * 0.9 + 3));
+                tgt = Math.min(tgt, this.vlim[look] * (this.mode == 1 ? 1.25 : 1));
+                if (this.play > 0) {
+                    // pull up to the SillyScroll stop: brake on a comfortable ramp, then hold
+                    let dist = this.sillyAhead();
+                    if (this.play == 1) {
+                        tgt = Math.min(tgt, Math.sqrt(2 * 2.6 * Math.max(dist - 0.4, 0)));
+                        if (dist < 1.5 && this.v < 1.2) {
+                            this.play = 2;
+                        }
+                    } else {
+                        tgt = 0;
+                    }
+                }
+            }
+            a = clamp((tgt - this.v) * 1.4, -7, accelMax);
+            let la = 6 + this.v * 0.55;
+            let t = routeAt(this.apS + la);
+            let dyaw = wrapAng(yawOf(<f64>t.x - this.px, <f64>t.z - this.pz) - this.yaw);
+            yawRateT = clamp(dyaw * (1.6 + this.v * 0.05), -maxRate, maxRate);
+        } else {
+            if (up && go) {
+                a = accelMax;
+            } else if (dn) {
+                a = this.v > 0.5 ? -9 : -2.5;
+            } else {
+                a = -0.6 - this.v * 0.012;
+            }
+            let st: f64 = (rt ? 1 : 0) - (lf ? 1 : 0);
+            yawRateT = st * maxRate * (this.v < 0 ? -1 : 1);
+        }
+        let topV = cruise / KMH * 1.25;
+        this.v = clamp(this.v + a * dt, -6, topV);
+        if (!this.autopilot && Math.abs(this.v) < 0.05 && !up && !dn) {
+            this.v = 0;
+        }
+        this.yawRate += (yawRateT - this.yawRate) * (1 - Math.exp(-dt * 7));
+        this.yaw = wrapAng(this.yaw + this.yawRate * dt);
+        this.steer = clamp(this.yawRate / Math.max(maxRate, 0.05), -1, 1);
+        let fx = Math.sin(this.yaw);
+        let fz = -Math.cos(this.yaw);
+        this.px += fx * this.v * dt;
+        this.pz += fz * this.v * dt;
+        if (!this.autopilot) {
+            this.collide();
+        }
+        this.accel += (a - this.accel) * (1 - Math.exp(-dt * 4));
+        // altitude: canyon lane / sky lane
+        this.altT = this.mode == 2 ? 140 : 62;
+        cdSpring(this.spring, this.alt, this.altV, this.altT, 1.7, dt);
+        this.alt = this.spring.x;
+        this.altV = this.spring.v;
+        let lat = this.v * this.yawRate;
+        // hovercraft attitude: bank hard into turns, nose dips on throttle, lifts on brake
+        this.roll += (clamp(lat * 0.03, -0.3, 0.3) - this.roll) * (1 - Math.exp(-dt * 3));
+        this.pitch += (clamp(-this.accel * 0.011 + this.altV * 0.015, -0.11, 0.11) - this.pitch) * (1 - Math.exp(-dt * 3.5));
+        let bob = Math.sin(this.time * 1.7) * 0.025 + Math.sin(this.time * 2.9) * 0.01;
+        this.carModel = basis(this.px, this.alt + bob, this.pz, this.yaw) * Mat4.fromRotationZ(<f32>-this.roll) * Mat4.fromRotationX(<f32>this.pitch);
+        this.carPos = V(this.px, this.alt, this.pz);
+        this.carFwd = V(fx, 0, fz);
+        this.bump *= Math.exp(-dt * 5);
+        this.battery = Math.max(5, this.battery - Math.max(this.v, 0) * dt * 0.0009);
+    }
+
+    private placeCar(parts: Array<Obj>, m: Mat4): void {
+        for (let i = 0; i < parts.length; i++) {
+            parts[i].model = m;
+        }
+    }
+
+    private simNpcs(dt: f64): void {
+        let lo = -2 * P;
+        let hi = (<f64>NB + 2) * P;
+        for (let i = 0; i < this.npcs.length; i++) {
+            let c = this.npcs[i];
+            let go = this.boot >= T_GO - 1.5;
+            if (c.kind <= 2) {
+                let look = <i32>Math.floor(wrapS(c.s + c.v * 0.8 * c.dir));
+                let tgt = go ? Math.min(c.v, this.vlim[look] * 0.95) : 0;
+                c.s = wrapS(c.s + tgt * dt * c.dir);
+                let p = routeAt(c.s);
+                let f = routeDir(c.s);
+                let x = <f64>p.x - <f64>f.z * c.off;
+                let z = <f64>p.z + <f64>f.x * c.off;
+                c.yaw = yawOf(<f64>f.x * c.dir, <f64>f.z * c.dir);
+                c.pos = V(x, c.alt, z);
+                let bob = Math.sin(this.time * 1.9 + c.s) * 0.03;
+                c.model = basis(x, c.alt + bob, z, c.yaw);
+            } else {
+                let sp = this.boot > T_DIVE ? c.v : c.v * 0.3;
+                c.s += sp * dt * c.dir;
+                if (c.s > hi) {
+                    c.s -= hi - lo;
+                } else if (c.s < lo) {
+                    c.s += hi - lo;
+                }
+                let x: f64 = 0;
+                let z: f64 = 0;
+                let fx: f64 = 0;
+                let fz: f64 = 0;
+                if (c.axis == 0) {
+                    x = c.s;
+                    z = c.line;
+                    fx = c.dir;
+                } else {
+                    x = c.line;
+                    z = c.s;
+                    fz = c.dir;
+                }
+                let bob = Math.sin(this.time * 1.3 + c.line) * 0.25;
+                c.pos = V(x, c.alt + bob, z);
+                c.yaw = yawOf(fx, fz);
+                c.model = basis(x, c.alt + bob, z, c.yaw) * Mat4.fromUniformScale(<f32>c.scale);
+            }
+            this.placeCar(c.parts, c.model);
+        }
+    }
+
+    // ------------------------------------------------------------ camera
+    private cEye: Vector = V(0, 0, 0);
+    private cTgt: Vector = V(0, 0, 0);
+    private cUp: Vector = V(0, 1, 0);
+
+    private cockpitCam(): void {
+        let m = this.carModel;
+        let e = Cab.eye;
+        let lat = this.v * this.yawRate;
+        let hx = <f64>e.x - clamp(lat * 0.006, -0.05, 0.05);
+        let hz = <f64>e.z + clamp(this.accel * 0.004, -0.03, 0.04);
+        let hy = <f64>e.y + 0.03 + this.bump * 0.02 * Math.sin(this.time * 60);
+        let eye = m.transformPoint(<f32>hx, <f32>hy, <f32>hz);
+        let hp = -0.035 + this.headPitch;
+        let hyw = this.headYaw - this.steer * 0.06;
+        let dx = Math.sin(hyw) * Math.cos(hp);
+        let dy = Math.sin(hp);
+        let dz = -Math.cos(hyw) * Math.cos(hp);
+        this.cEye = eye;
+        this.cTgt = m.transformPoint(<f32>(hx + dx), <f32>(hy + dy), <f32>(hz + dz));
+        // keep half the bank in first person: dynamic, not nauseating
+        this.cUp = vnorm(vadd(vnorm(vsub(m.transformPoint(<f32>hx, <f32>(hy + 1), <f32>hz), eye)), V(0, 1, 0), 1));
+    }
+
+    private hEye: Vector = V(0, 0, 0);
+    private hTgt: Vector = V(0, 0, 0);
+
+    private chaseCam(dt: f64): void {
+        let d = wrapAng(this.yaw - this.chaseYaw);
+        cdSpring(this.spring, 0, this.chaseV, d, 2.6, dt);
+        this.chaseYaw = this.yaw - this.spring.x;
+        this.chaseV = this.spring.v;
+        let yaw = this.chaseYaw + this.headYaw * 2;
+        let fx = Math.sin(yaw);
+        let fz = -Math.cos(yaw);
+        let p = this.carPos;
+        let back = 9.0;
+        let h = 2.1 + this.headPitch * -8;
+        // swing to the outside of the turn so the bank reads in profile
+        let lat = this.v * this.yawRate;
+        this.camSwing += (clamp(-lat * 0.16, -2.4, 2.4) - this.camSwing) * (1 - Math.exp(-dt * 2));
+        let rx = -fz;
+        let rz = fx;
+        this.hEye = V(<f64>p.x - fx * back + rx * this.camSwing, <f64>p.y + h, <f64>p.z - fz * back + rz * this.camSwing);
+        this.hTgt = V(<f64>p.x + fx * 14, <f64>p.y + 1.3, <f64>p.z + fz * 14);
+        // roll with the car's bank plus a slow drift: a camera operator, not a rig
+        let a = this.roll * 0.6 + Math.sin(this.time * 0.23) * 0.03 + Math.sin(this.time * 0.61) * 0.012;
+        this.hUp = V(Math.sin(a) * rx, Math.cos(a), Math.sin(a) * rz);
+    }
+
+    private camSwing: f64 = 0;
+    private hUp: Vector = V(0, 1, 0);
+
+    private dFov: f64 = 1;
+
+    // from a backlit skyline, plunge into the car's canyon, race the swarm
+    // down the street, settle behind the car and drop through the canopy
+    private diveCam(x: f64): void {
+        let p = this.carPos;
+        let f = this.carFwd;
+        let r = V(-<f64>f.z, 0, <f64>f.x);
+        let up = V(0, 1, 0);
+        let gy = V(<f64>p.x, 0, <f64>p.z);
+        let sd = sunDir();
+        let sh = vnorm(V(<f64>sd.x, 0, <f64>sd.z));
+        // opening shot (= title overview): close enough that the near towers read as
+        // dark silhouettes against the bright sky slit, not haze
+        let p0 = vadd(vadd(vadd(gy, sh, -720), up, 235), r, 90);
+        let p1 = vadd(vadd(vadd(gy, f, -560), up, 250), r, 40);
+        let p2 = vadd(vadd(gy, f, -300), up, <f64>p.y + 14);
+        let p3 = vadd(vadd(vadd(p, f, -46), up, 9), r, 5);
+        let p4 = vadd(vadd(p, f, -9.0), up, 2.6);
+        let p5 = vadd(vadd(vadd(p, f, -2.2), up, 1.35), r, -0.2);
+        let ps: Array<Vector> = [p0, p1, p2, p3, p4, p5, this.cEye];
+        let ts: Array<f64> = [0, 0.26, 0.5, 0.7, 0.85, 0.94, 1.0];
+        let t0 = vadd(vadd(gy, sh, 520), up, 95);
+        let t1 = vadd(vadd(gy, f, -120), up, 40);
+        let t2 = vadd(p, up, 2);
+        let t3 = vadd(p, f, 6);
+        let t4 = vadd(vadd(p, f, 4), up, 0.8);
+        let t5 = vadd(vadd(p, f, 6), up, 1.0);
+        let tg: Array<Vector> = [t0, t1, t2, t3, t4, t5, this.cTgt];
+        let q = smooth5(x);
+        let q2 = Math.pow(x, 0.92);
+        let qq = q * 0.6 + smooth5(q2) * 0.4;
+        this.eye = hermite(ps, ts, qq);
+        this.target = hermite(tg, ts, qq);
+        this.dFov = 60 * PI / 180 + Math.sin(PI * qq) * 22 * PI / 180;
+    }
+
+    private updateCamera(dt: f64): void {
+        if (this.sizeX <= 0) {
+            return;
+        }
+        // after release the look settles briefly (short glide, same limits as the drag)
+        if (!this.dragging) {
+            this.headYaw = clamp(this.headYaw + this.headVel * dt, -1.3, 1.3);
+            this.headVel *= Math.exp(-dt * 8);
+            // the view stays where the driver left it; it only eases home when autopilot engages
+            if (this.lookHome) {
+                let k = 1 - Math.exp(-dt * 1.8);
+                this.headYaw -= this.headYaw * k;
+                this.headPitch -= this.headPitch * k;
+                if (Math.abs(this.headYaw) + Math.abs(this.headPitch) < 1e-3) {
+                    this.lookHome = false;
+                }
+            }
+        }
+        this.camBlend += ((this.camMode >= 1 ? 1 : 0) - this.camBlend) * (1 - Math.exp(-dt * 3.2));
+        this.orbitBlend += ((this.camMode == 2 ? 1 : 0) - this.orbitBlend) * (1 - Math.exp(-dt * 2.4));
+        this.cockpitCam();
+        this.chaseCam(dt);
+        let cb = smooth5(this.camBlend);
+        let eye = vlerp(this.cEye, this.hEye, cb);
+        let tgt = vlerp(this.cTgt, this.hTgt, cb);
+        let up = vlerp(this.cUp, this.camMode == 2 ? V(0, 1, 0) : this.hUp, cb);
+        let fov = 68 * PI / 180 + cb * -12 * PI / 180;
+        if (this.orbitBlend > 0.001) {
+            // showroom orbit: slow turntable around the car, drag to swing
+            this.orbitA += dt * 0.18;
+            let a = this.orbitA + this.yaw + this.headYaw * 2.5;
+            let d = 5.6 - this.headPitch * 4;
+            let oe = vadd(this.carPos, V(Math.sin(a) * d, 1.15 + this.headPitch * 3, -Math.cos(a) * d), 1);
+            let ot = vadd(this.carPos, V(0, 0.62, 0), 1);
+            let ob = smooth5(this.orbitBlend);
+            eye = vlerp(eye, oe, ob);
+            tgt = vlerp(tgt, ot, ob);
+            fov = fov + (40 * PI / 180 - fov) * ob;
+        }
+        let x = (this.boot - T_DIVE) / DIVE_DUR;
+        if (x < 1) {
+            this.diveCam(Math.max(x, 0));
+            eye = this.eye;
+            tgt = this.target;
+            fov = this.dFov;
+            // title: a slow crane/orbit drift over the overview, eased out as the dive takes over
+            let wd = this.entered ? Math.exp(-this.enterT * 1.6) : 1;
+            if (wd > 0.001) {
+                let tt = this.tt;
+                let dr = V(Math.sin(tt * 0.11) * 60, Math.sin(tt * 0.083) * 18 - 10, Math.cos(tt * 0.07) * 45 - 45);
+                eye = vadd(eye, dr, wd);
+                tgt = vadd(tgt, V(Math.sin(tt * 0.06) * 30, 0, 0), wd);
+                // home screen: the camera looks a touch toward the mouse (eased), the eye slides the
+                // other way for parallax, and it banks slightly into the move
+                let km = 1 - Math.exp(-dt * 2.6);
+                this.tmx += (this.tmxT - this.tmx) * km;
+                this.tmy += (this.tmyT - this.tmy) * km;
+                let fw = vsub(tgt, eye);
+                let L = vlen(fw);
+                let rt = vnorm(vcross(fw, V(0, 1, 0)));
+                tgt = vadd(vadd(tgt, rt, this.tmx * L * 0.07 * wd), V(0, 1, 0), -this.tmy * L * 0.045 * wd);
+                eye = vadd(vadd(eye, rt, -this.tmx * 22 * wd), V(0, 1, 0), this.tmy * 8 * wd);
+                this.tiltRoll = -this.tmx * 0.045 * wd;
+            } else {
+                this.tiltRoll = 0;
+            }
+            up = vlerp(V(0, 1, 0), this.cUp, smooth5((x - 0.9) / 0.1));
+            if (Math.abs(this.tiltRoll) > 1e-5) {
+                let rr = vnorm(vcross(vsub(tgt, eye), V(0, 1, 0)));
+                up = vnorm(vadd(up, rr, this.tiltRoll));
+            }
+        }
+        // SillyScroll: once stopped, float out of the seat to a square-on framing of the board
+        this.playK += ((this.play == 2 ? 1 : 0) - this.playK) * (1 - Math.exp(-dt * 1.7));
+        if (this.playK > 0.001 && this.sillyOk && x >= 1) {
+            let pk = smooth5(this.playK);
+            let n = V(this.sillyNx, 0, this.sillyNz);
+            // 20 m board ~ 85% of the frame height; closer (wider) where buildings limit the pull-back
+            let D = Math.min(this.sillyD, 11.8 / Math.tan(PLAY_FOV / 2));
+            let pfov = 2 * Math.atan(11.8 / D);
+            let pe = vadd(vadd(this.sillyC, n, D), V(0, 1, 0), -0.6);
+            eye = vadd(vlerp(eye, pe, pk), V(0, 1, 0), Math.sin(PI * pk) * 4);
+            tgt = vlerp(tgt, this.sillyC, pk);
+            up = vnorm(vlerp(up, V(0, 1, 0), pk));
+            fov = fov + (pfov - fov) * pk;
+        }
+        let dist = vlen(vsub(eye, this.cEye));
+        this.inside = dist < 0.25 && cb < 0.02;
+        // speed of the image for the zoom blur
+        let sp = vlen(vsub(eye, this.lastEye)) / Math.max(dt, 1e-3);
+        this.lastEye = eye;
+        if (x < 1) {
+            this.camSpeed = Math.min(sp / 120, 1) * Math.pow(Math.sin(PI * clamp(x, 0, 1)), 0.5);
+        } else {
+            this.camSpeed = 0;
+        }
+        this.eye = eye;
+        this.target = tgt;
+        this.up = up;
+        let aspect = this.sizeX / Math.max(this.sizeY, 1);
+        let yfov = fov;
+        if (aspect < 1.5) {
+            yfov = 2 * Math.atan(Math.tan(fov / 2) * 1.5 / aspect);
+        }
+        this.fov = yfov;
+        this.view = Mat4.lookAtVector(eye, tgt, up);
+        let near = this.inside ? 0.25 : clamp(dist * 0.05, 0.02, 0.5);
+        if (<f64>eye.y > 120) {
+            near = Math.max(near, <f64>eye.y * 0.02);
+        }
+        let pM = Mat4.perspective(<f32>yfov, <f32>aspect, <f32>near, 5000);
+        let pB = Mat4.perspective(<f32>yfov, <f32>aspect, 0.015, 8);
+        this.viewProj = pM * this.view;
+        this.viewProjB = pB * this.view;
+        // GPU matrices built at the origin: no 1 km translation to cancel in f32
+        let viewRel = Mat4.lookAtVector(V(0, 0, 0), vsub(tgt, eye), up);
+        this.viewProjRelNJ = pM * viewRel;
+        // TAA: sub-pixel Halton(2,3) jitter on the world projection only (the
+        // cockpit pass stays put so the screens never swim)
+        this.jitN = (this.jitN + 1) % 8;
+        let jx = (halton(this.jitN + 1, 2) - 0.5) * 2 / Math.max(<f64>this.gw, 1);
+        let jy = (halton(this.jitN + 1, 3) - 0.5) * 2 / Math.max(<f64>this.gh, 1);
+        let J = Mat4.values(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, <f32>jx, <f32>jy, 0, 1);
+        this.viewProjRel = J * pM * viewRel;
+        this.viewProjBRel = pB * viewRel;
+        let inv = this.viewProj.invert();
+        this.invVP = inv != null ? inv : Mat4.identity();
+        // picking basis (exact; no inverse of a far-plane matrix in f32)
+        let cf = vnorm(vsub(tgt, eye));
+        let cr = vnorm(vcross(cf, up));
+        this.camF = cf;
+        this.camR = cr;
+        this.camU = vcross(cr, cf);
+        this.camAspect = aspect;
+    }
+
+    // ------------------------------------------------------------ cockpit placement
+    private placeCockpit(): void {
+        let m = this.carModel;
+        for (let i = 0; i < this.cab.length; i++) {
+            this.cab[i].model = m;
+        }
+        let cl = m * Mat4.fromTranslation(Cab.clPos.x, Cab.clPos.y, Cab.clPos.z) * Mat4.fromRotationX(<f32>Cab.clPitch);
+        this.placeCar(this.clParts, cl);
+        let cs = m * Mat4.fromTranslation(Cab.csPos.x, Cab.csPos.y, Cab.csPos.z) * Mat4.fromRotationY(<f32>Cab.csYaw) *
+            Mat4.fromRotationX(<f32>Cab.csPitch);
+        this.placeCar(this.csParts, cs);
+        let yk = m * Mat4.fromTranslation(Cab.ykPos.x, Cab.ykPos.y, Cab.ykPos.z) * Mat4.fromRotationX(<f32>Cab.ykTilt) *
+            Mat4.fromRotationZ(<f32>(-this.steer * 0.9));
+        this.placeCar(this.yokeParts, yk);
+        this.placeCar(this.ext, m);
+        // canopy dissolve as the camera flies into the seat
+        let dg = vlen(vsub(this.eye, tp(m, Cab.eye)));
+        let eg = this.extGlass;
+        if (eg != null) {
+            eg.fx[2] = clamp(1 - (dg - 0.6) / 3.2, 0, 1);
+        }
+        // the driver's own seat dissolves as the intro camera flies through it
+        // and stays hidden while seated (it would fill the view on head turns)
+        let sd = this.inside || this.camMode == 0 && dg < 0.3 ? 1 : clamp(1 - (dg - 0.35) / 1.6, 0, 1);
+        for (let i = 0; i < this.dseat.length; i++) {
+            this.dseat[i].fx[2] = sd;
+        }
+    }
+
+    // ------------------------------------------------------------ AR markers (eye -> world ray onto the windshield)
+    private gU: f64 = 0;
+    private gV: f64 = 0;
+
+    private glassUV(wp: Vector): bool {
+        let inv = this.carModel.invert();
+        if (inv == null) {
+            return false;
+        }
+        let o = Cab.eye;
+        let q = tp(inv, wp);
+        let d = vsub(q, o);
+        let len = vlen(d);
+        if (len < 1e-4) {
+            return false;
+        }
+        d = vscale(d, 1 / len);
+        if (<f64>d.z > -0.05) {
+            return false;
+        }
+        let A = Cab.glassA;
+        let w = vsub(o, Cab.glassO);
+        let wp2 = vadd(w, A, -vdot(w, A));
+        let dp = vadd(d, A, -vdot(d, A));
+        let a = vdot(dp, dp);
+        let b = 2 * vdot(wp2, dp);
+        let c = vdot(wp2, wp2) - Cab.glassR * Cab.glassR;
+        let disc = b * b - 4 * a * c;
+        if (disc < 0 || a < 1e-9) {
+            return false;
+        }
+        let s = (-b + Math.sqrt(disc)) / (2 * a);
+        let hit = vadd(o, d, s);
+        let rel = vsub(hit, Cab.glassO);
+        let t = vdot(rel, A);
+        let radial = vadd(rel, A, -t);
+        let th = Math.atan2(vdot(radial, Cab.glassX), vdot(radial, Cab.glassF));
+        let gu = (th - Cab.th0) / (Cab.th1 - Cab.th0);
+        let gv = 1 - (t - Cab.t0) / (Cab.t1 - Cab.t0);
+        // the HUD is a virtual image on a VISOR: a cylinder r 2.5 m around the eye (lit.wgsl HUD_*),
+        // so it bows toward the edges like a helmet visor; arc length maps to HUD artboard x
+        let k = 2.5 / Math.max(Math.sqrt(<f64>d.x * <f64>d.x + <f64>d.z * <f64>d.z), 1e-4);
+        let hy = <f64>d.y * k;
+        let thv = Math.atan2(<f64>d.x, -<f64>d.z);
+        let u = (600 + 2.5 * thv / 0.0028) / 2000;
+        let v = (617 - hy / 0.0028) / 1240;
+        this.gU = u;
+        this.gV = v;
+        return gu > 0.02 && gu < 0.98 && gv > 0.04 && gv < 0.96 && u > 0.02 && u < 0.98 && v > 0.03 && v < 0.97;
+    }
+
+    private updateMarkers(dt: f64): void {
+        let hud = this.surfs[3];
+        let W = hud.w;
+        let H = hud.h;
+        let cands = new Array<Cand>();
+        let p = this.carPos;
+        let f = this.carFwd;
+        for (let i = 0; i < this.bbs.length; i++) {
+            let b = this.bbs[i];
+            let dx = <f64>b.c.x - <f64>p.x;
+            let dz = <f64>b.c.z - <f64>p.z;
+            let d = Math.sqrt(dx * dx + dz * dz);
+            let along = dx * <f64>f.x + dz * <f64>f.z;
+            if (d < 260 && d > 22 && along > d * 0.6 && (b.nx * -dx + b.nz * -dz) > 0) {
+                cands.push(new Cand(d, b));
+            }
+        }
+        cands.sort((a: Cand, b: Cand): i32 => (a.d < b.d ? -1 : (a.d > b.d ? 1 : 0)));
+        let want = new Array<Want>();
+        for (let i = 0; i < Math.min(3, cands.length); i++) {
+            let b = cands[i].b;
+            let w = new Want();
+            w.wp = V(<f64>b.c.x, <f64>b.c.y + b.h * 0.5 + 1.2, <f64>b.c.z);
+            w.title = BB_NAMES[b.design];
+            w.dist = fmtM(cands[i].d);
+            w.key = <f64>b.design * 1000 + Math.floor(<f64>b.c.x);
+            want.push(w);
+        }
+        for (let k = 0; k < 3; k++) {
+            let mk = this.markers[k];
+            let tOp: f64 = 0;
+            if (k < want.length && this.inside && this.hudOn) {
+                let w = want[k];
+                if (this.glassUV(w.wp)) {
+                    let u = this.gU;
+                    let v = this.gV;
+                    if (mk.key != w.key) {
+                        mk.key = w.key;
+                        mk.x = u * W;
+                        mk.y = v * H;
+                    }
+                    let kk = 1 - Math.exp(-dt * 14);
+                    mk.x += (u * W - mk.x) * kk;
+                    mk.y += (v * H - mk.y) * kk;
+                    mk.title = w.title;
+                    mk.dist = w.dist;
+                    tOp = 1;
+                }
+            }
+            mk.op += (tOp - mk.op) * (1 - Math.exp(-dt * 8));
+            let n = "m" + (k + 1).toString();
+            this.setN(n + "x", Math.floor(mk.x * 2 + 0.5) / 2);
+            this.setN(n + "y", Math.floor(mk.y * 2 + 0.5) / 2);
+            this.setN(n + "op", Math.floor(mk.op * 100 + 0.5) / 100);
+            this.setS(n + "t", mk.title);
+            this.setS(n + "d", mk.dist);
+        }
+    }
+
+    // ------------------------------------------------------------ HUD declutter
+    // Trackers (nearest first) then billboard markers claim screen space in priority
+    // order. An item whose reticle/brackets land on a higher-priority one fades out;
+    // each label tries its previous quadrant, then the others, and must stay on the
+    // glass, off the readout cluster and off everything already placed.
+    private freeAt(r: Rect, occ: Array<Rect>, W: f64, H: f64): bool {
+        if (r.x0 < 30 || r.y0 < 30 || r.x1 > W - 30 || r.y1 > H - 30) {
+            return false;
+        }
+        for (let i = 0; i < occ.length; i++) {
+            if (r.hits(occ[i])) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private labelRect(q: i32, ax: f64, ay: f64, lead: f64, w: f64, h: f64): Rect {
+        let x0 = Q_FX[q] > 0 ? ax + lead : ax - lead - w;
+        let y0 = Q_FY[q] > 0 ? ay - lead - h : ay + lead;
+        return new Rect(x0, y0, x0 + w, y0 + h);
+    }
+
+    private declutterHud(dt: f64): void {
+        let hud = this.surfs[3];
+        let W = hud.w;
+        let H = hud.h;
+        let occ = new Array<Rect>();
+        occ.push(new Rect(RO_X0, RO_Y0, RO_X1, RO_Y1));
+        let kf = 1 - Math.exp(-dt * 12);
+        // trackers by distance
+        let order = new Array<i32>();
+        for (let k = 0; k < 4; k++) {
+            order.push(k);
+        }
+        let trks = this.trks;
+        order.sort((a: i32, b: i32): i32 => (trks[a].dPrev < trks[b].dPrev ? -1 : 1));
+        for (let n = 0; n < 4; n++) {
+            let k = order[n];
+            let tk = trks[k];
+            let nm = "t" + (k + 1).toString();
+            let show = tk.op > 0.05 && tk.key >= 0;
+            let lshow = false;
+            let lr = new Rect(-600, -600, -600, -600);
+            if (show) {
+                let rr = 58 * tk.s;
+                let ret = new Rect(tk.x - rr, tk.y - rr, tk.x + rr, tk.y + rr);
+                let clash = false;
+                for (let i = 1; i < occ.length; i++) {
+                    if (ret.hits(occ[i])) {
+                        clash = true;
+                        break;
+                    }
+                }
+                if (ret.hits(occ[0])) {
+                    clash = true;
+                }
+                show = !clash;
+                if (show) {
+                    occ.push(ret);
+                    for (let t = 0; t < 5; t++) {
+                        let q = t == 0 ? tk.q : t - 1;
+                        let r = this.labelRect(q, tk.x, tk.y, 62 * tk.s, TRK_W, TRK_H);
+                        if (this.freeAt(r, occ, W, H)) {
+                            tk.q = q;
+                            lr = r;
+                            lshow = true;
+                            break;
+                        }
+                    }
+                    if (lshow) {
+                        occ.push(lr);
+                    }
+                }
+            }
+            tk.vis += ((show ? 1 : 0) - tk.vis) * kf;
+            tk.lvis += ((lshow ? 1 : 0) - tk.lvis) * kf;
+            this.setN(nm + "op", Math.floor(tk.op * tk.vis * 100 + 0.5) / 100);
+            this.setN(nm + "fx", Q_FX[tk.q]);
+            this.setN(nm + "fy", Q_FY[tk.q]);
+            if (lshow) {
+                this.setN(nm + "lx", Math.floor(lr.x0 + 0.5));
+                this.setN(nm + "ly", Math.floor(lr.y0 + 0.5));
+            }
+            this.setN(nm + "lo", Math.floor(tk.op * tk.vis * tk.lvis * 100 + 0.5) / 100);
+        }
+        // billboard markers (already nearest-first)
+        for (let k = 0; k < 3; k++) {
+            let mk = this.markers[k];
+            let nm = "m" + (k + 1).toString();
+            let show = mk.op > 0.05;
+            let lshow = false;
+            let lr = new Rect(-600, -600, -600, -600);
+            if (show) {
+                let br = new Rect(mk.x - 32, mk.y - 32, mk.x + 32, mk.y + 32);
+                for (let i = 0; i < occ.length; i++) {
+                    if (br.hits(occ[i])) {
+                        show = false;
+                        break;
+                    }
+                }
+                if (show) {
+                    occ.push(br);
+                    for (let t = 0; t < 5; t++) {
+                        let q = t == 0 ? mk.q : t - 1;
+                        let r = this.labelRect(q, mk.x, mk.y, 46, MK_W, MK_H);
+                        if (this.freeAt(r, occ, W, H)) {
+                            mk.q = q;
+                            lr = r;
+                            lshow = true;
+                            break;
+                        }
+                    }
+                    if (lshow) {
+                        occ.push(lr);
+                    }
+                }
+            }
+            mk.vis += ((show ? 1 : 0) - mk.vis) * kf;
+            mk.lvis += ((lshow ? 1 : 0) - mk.lvis) * kf;
+            this.setN(nm + "op", Math.floor(mk.op * mk.vis * 100 + 0.5) / 100);
+            this.setN(nm + "fx", Q_FX[mk.q]);
+            this.setN(nm + "fy", Q_FY[mk.q]);
+            if (lshow) {
+                this.setN(nm + "lx", Math.floor(lr.x0 + 0.5));
+                this.setN(nm + "ly", Math.floor(lr.y0 + 0.5));
+            }
+            this.setN(nm + "lo", Math.floor(mk.op * mk.vis * mk.lvis * 100 + 0.5) / 100);
+        }
+    }
+
+    // ------------------------------------------------------------ HUD vehicle trackers
+    private updateTrackers(dt: f64): void {
+        let hud = this.surfs[3];
+        let W = hud.w;
+        let H = hud.h;
+        let e = this.eye;
+        let cf = this.camF;
+        let live = this.inside && this.hudOn && this.boot >= T_HUD;
+        let cands = new Array<TrkCand>();
+        if (live) {
+            let ex = <f64>e.x;
+            let ey = <f64>e.y;
+            let ez = <f64>e.z;
+            let fx = <f64>cf.x;
+            let fy = <f64>cf.y;
+            let fz = <f64>cf.z;
+            // swarm (instanced): rebuild positions like vs_swarm
+            let sw = this.swCpu;
+            let n = sw.length / 8;
+            let t = this.time;
+            for (let i = 0; i < n; i++) {
+                let o = i * 8;
+                let ly = <f64>sw[o + 1];
+                if (Math.abs(ly - ey) > 60) {
+                    continue;
+                }
+                let len = <f64>sw[o + 6];
+                let seed = <f64>sw[o + 7];
+                let sp = <f64>sw[o + 3];
+                let u = seed * 7.13 + t * sp / len;
+                let s0 = (u - Math.floor(u)) * len - len * 0.5;
+                let dir = <f64>sw[o + 5];
+                let px = <f64>sw[o];
+                let pz = <f64>sw[o + 2];
+                if (<f64>sw[o + 4] > 0.5) {
+                    pz += dir * s0;
+                } else {
+                    px += dir * s0;
+                }
+                let py = ly + Math.sin(t * 1.7 + seed * 40) * 0.35;
+                let dx = px - ex;
+                let dy = py - ey;
+                let dz = pz - ez;
+                let along = dx * fx + dy * fy + dz * fz;
+                if (along < 8 || along > 130) {
+                    continue;
+                }
+                let d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+                if (along < d * 0.86) {
+                    continue;
+                }
+                cands.push(new TrkCand(d, <f64>i, V(px, py, pz)));
+            }
+            for (let i = 0; i < this.npcs.length; i++) {
+                let c = this.npcs[i];
+                let p = c.pos;
+                let dx = <f64>p.x - ex;
+                let dy = <f64>p.y + 0.6 - ey;
+                let dz = <f64>p.z - ez;
+                let along = dx * fx + dy * fy + dz * fz;
+                let d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+                if (along > 6 && along < 160 && along > d * 0.86) {
+                    cands.push(new TrkCand(d, 100000 + <f64>i, V(<f64>p.x, <f64>p.y + 0.6, <f64>p.z)));
+                }
+            }
+            cands.sort((a: TrkCand, b: TrkCand): i32 => (a.d < b.d ? -1 : (a.d > b.d ? 1 : 0)));
+            if (cands.length > 10) {
+                cands = cands.slice(0, 10);
+            }
+        }
+        // keep slots locked on their targets; free slots take the nearest new ones
+        let taken = new Array<bool>(cands.length);
+        let slotC = new Array<i32>(4);
+        for (let k = 0; k < 4; k++) {
+            slotC[k] = -1;
+            let tk = this.trks[k];
+            // hysteresis: a locked target holds its slot while it stays in the nearest 8
+            for (let j = 0; j < cands.length; j++) {
+                if (!taken[j] && cands[j].key == tk.key) {
+                    slotC[k] = j;
+                    taken[j] = true;
+                    break;
+                }
+            }
+        }
+        for (let k = 0; k < 4; k++) {
+            if (slotC[k] >= 0) {
+                continue;
+            }
+            for (let j = 0; j < Math.min(4, cands.length); j++) {
+                if (!taken[j]) {
+                    slotC[k] = j;
+                    taken[j] = true;
+                    break;
+                }
+            }
+        }
+        for (let k = 0; k < 4; k++) {
+            let tk = this.trks[k];
+            let tOp: f64 = 0;
+            let j = slotC[k];
+            // only in the upper windshield band: below it the dash and cluster sit in front
+            if (j >= 0 && this.glassUV(cands[j].p) && this.gV * H < 600 && this.gV * H > 90 && this.gU * W > 120 && this.gU * W < W - 360) {
+                let c = cands[j];
+                let ux = this.gU * W;
+                let uy = this.gV * H;
+                if (tk.key != c.key) {
+                    // new lock: drop to zero first so the Lock animation replays
+                    tk.key = c.key;
+                    tk.x = ux;
+                    tk.y = uy;
+                    tk.op = 0;
+                    tk.hold = 3;
+                    tk.dPrev = c.d;
+                    tk.vc = 0;
+                    let hsh = <i32>((c.key * 2654435761) % 65536);
+                    tk.id = (c.key >= 100000 ? "KX-" : "HX-") + ((hsh % 9000) + 1000).toString();
+                    tk.cl = TRK_CLASSES[(hsh >> 3) % TRK_CLASSES.length];
+                }
+                let kk = 1 - Math.exp(-dt * 16);
+                tk.x += (ux - tk.x) * kk;
+                tk.y += (uy - tk.y) * kk;
+                tk.s = clamp(52 / c.d, 0.72, 1.3);
+                let vcNow = dt > 0 ? (tk.dPrev - c.d) / dt : 0;
+                tk.vc += (vcNow - tk.vc) * (1 - Math.exp(-dt * 4));
+                tk.dPrev = c.d;
+                tk.hexT -= dt;
+                if (tk.hexT <= 0) {
+                    tk.hexT = 0.18;
+                    tk.hex = hex4(<i32>(Math.random() * 65535));
+                }
+                if (tk.hold > 0) {
+                    tk.hold--;
+                } else {
+                    tOp = 1;
+                }
+                let n = "t" + (k + 1).toString();
+                let kmh = tk.vc * 3.6;
+                let ak = <i32>Math.min(99, Math.abs(Math.round(kmh)));
+                this.setS(n + "d", fmt1(c.d));
+                this.setS(n + "v", (kmh >= 0 ? "+" : "-") + (ak < 10 ? "0" : "") + ak.toString() + " KM/H");
+                this.setS(n + "tt", tk.vc > 0.6 ? "TTC " + fmt1(Math.min(c.d / tk.vc, 99)) : "TTC --.-");
+                this.setS(n + "hx", tk.hex);
+                this.setS(n + "id", tk.id);
+                this.setS(n + "cl", tk.cl);
+                let threat = clamp((32 - c.d) / 20, 0, 1);
+                this.setN(n + "r", Math.floor(threat * 50 + 0.5) / 50);
+                this.setN(n + "n", Math.floor((1 - threat) * 50 + 0.5) / 50);
+                this.setN(n + "c", Math.floor(clamp(tk.vc / 20, 0, 1) * 50 + 0.5) / 50);
+            } else {
+                tk.key = -1;
+            }
+            tk.op += (tOp - tk.op) * (tOp > tk.op ? 1 - Math.exp(-dt * 10) : 1 - Math.exp(-dt * 14));
+            if (tOp == 0 && tk.op < 0.04) {
+                tk.op = 0;
+            }
+            let n = "t" + (k + 1).toString();
+            this.setN(n + "x", Math.floor(tk.x * 2 + 0.5) / 2);
+            this.setN(n + "y", Math.floor(tk.y * 2 + 0.5) / 2);
+            this.setN(n + "s", Math.floor(tk.s * 100 + 0.5) / 100);
+            this.setN(n + "op", Math.floor(tk.op * 100 + 0.5) / 100);
+        }
+    }
+
+    // ------------------------------------------------------------ telemetry -> view model
+    private stName: string = "";
+    private stNext: string = "";
+    private stTo: f64 = 0;
+    private stTurn: f64 = 1;
+
+    private streetAt(s: f64): void {
+        for (let i = 0; i < City.streets.length; i++) {
+            let st = City.streets[i];
+            let ss = s;
+            if (ss < st.s0) {
+                ss += <f64>ROUTE_N;
+            }
+            if (ss >= st.s0 && ss < st.s1) {
+                this.stName = st.name;
+                this.stNext = st.next;
+                this.stTo = st.s1 - ss;
+                this.stTurn = st.turn;
+                return;
+            }
+        }
+        let st = City.streets[0];
+        this.stName = st.name;
+        this.stNext = st.next;
+        this.stTo = 0;
+        this.stTurn = st.turn;
+    }
+
+    private writeTelemetry(): void {
+        let b = this.boot;
+        let kmh = Math.abs(this.v) * KMH;
+        let sw: f64 = 0;
+        if (b > T_CL + 0.4 && b < T_CL + 1.7) {
+            sw = Math.sin(PI * (b - T_CL - 0.4) / 1.3);
+        }
+        let maxK: f64 = 160;
+        this.setN("speedFrac", Math.max(kmh / maxK, sw));
+        let shown = Math.floor(kmh + 0.5);
+        if (sw > 0) {
+            shown = Math.floor(sw * maxK + 0.5);
+        }
+        this.setS("speed", formatInt(shown));
+        this.setS("bbSpeed", formatInt(Math.floor(kmh + 0.5), 3, true));
+        let pw = clamp(this.accel * Math.max(this.v, 0) / 60, 0, 1);
+        this.setN("powerFrac", Math.max(pw * 0.8 + Math.min(kmh / maxK, 1) * 0.2, sw));
+        this.setN("batteryFrac", Math.max(this.battery / 100, sw));
+        this.setS("battery", formatInt(Math.floor(this.battery + 0.5)));
+        this.setS("range", formatInt(Math.floor(this.battery * 5.1 + 0.5)));
+        this.setS("alt", formatFixed(this.alt, 1));
+        this.setN("altFrac", clamp((this.alt - 62) / 78, 0, 1));
+        let gear = b >= T_READY ? (this.v < -0.3 ? "R" : "D") : "P";
+        this.setS("gear", gear);
+        this.setN("gP", gear == "P" ? 1 : 0.25);
+        this.setN("gR", gear == "R" ? 1 : 0.25);
+        this.setN("gN", gear == "N" ? 1 : 0.25);
+        this.setN("gD", gear == "D" ? 1 : 0.25);
+        this.setN("ap", this.autopilot ? 1 : 0);
+        this.setS("apLabel", this.autopilot ? "AUTOPILOT" : "MANUAL");
+        this.setS("apSub", this.autopilot ? "HANDS FREE  ·  LANE + ROUTE LOCK" : "HANDS ON  ·  WASD TO STEER");
+        this.setN("mode", <f64>this.mode);
+        this.setS("modeName", MODE_NAMES[this.mode]);
+        this.setN("steer", this.steer);
+        this.setN("view", <f64>this.camMode);
+        // navigation
+        this.streetAt(this.apS);
+        this.setS("street", this.stName);
+        this.setS("navDist", fmtM(this.stTo));
+        this.setS("navStreet", this.stNext);
+        this.setN("navTurn", this.stTurn);
+        this.setS("navVerb", this.stTurn > 0 ? "TURN RIGHT" : "TURN LEFT");
+        // media
+        let dur = TRACK_DUR[this.track];
+        this.setN("track", <f64>this.track);
+        this.setS("trackTitle", TRACK_TITLE[this.track]);
+        this.setS("trackArtist", TRACK_ARTIST[this.track]);
+        this.setN("playing", this.playing ? 1 : 0);
+        this.setN("progress", this.progress / dur);
+        let el = Math.floor(this.progress);
+        this.setS("trackTime", formatInt(Math.floor(el / 60)) + ":" + formatInt(el % 60, 2, true) + " / " +
+            formatInt(Math.floor(dur / 60)) + ":" + formatInt(dur % 60, 2, true));
+        this.setN("ambient", <f64>this.ambient);
+        this.setS("ambName", AMB_NAMES[this.ambient]);
+        this.setS("taps", formatInt(<f64>this.taps, 4, true));
+        this.setN("hitT", this.hitT > 0 ? 1 : 0);
+        // clock / climate
+        let mins = Math.floor(this.time / 60);
+        let hh: f64 = 23;
+        let mm: f64 = 47 + mins;
+        if (this.nightT < 0.5) {
+            hh = 14;
+            mm = 20 + mins;
+        }
+        hh = (hh + Math.floor(mm / 60)) % 24;
+        mm = mm % 60;
+        this.setS("clock", formatInt(hh, 2, true) + ":" + formatInt(mm, 2, true));
+        this.setS("temp", this.nightT > 0.5 ? "17°C" : "24°C");
+        this.setN("night", this.night);
+        this.setN("sunOp", 1 - 0.7 * this.night);
+        this.setN("moonOp", 0.3 + 0.7 * this.night);
+        this.pickPlayTarget();
+        let ahead = this.sillyOk ? this.sillyAhead() : 1e9;
+        let pname = BB_NAMES[this.playDes];
+        if (this.play == 2) {
+            this.setS("readout", pname + "  ·  DRAG THE CHARACTERS TO MIX THEM  ·  E TO DRIVE ON");
+        } else if (this.play == 1) {
+            this.setS("readout", "PULLING UP TO " + pname + "  ·  " + formatInt(ahead) + " M  ·  E TO CANCEL");
+        } else if (ahead < 420 && this.entered) {
+            this.setS("readout", pname + " AHEAD  ·  " + formatInt(ahead) + " M  ·  PRESS E TO STOP AND PLAY");
+        } else this.setS("readout", (this.autopilot ? "AUTOPILOT" : "MANUAL") + "  ·  " + MODE_NAMES[this.mode] + "  ·  " + this.stName +
+            "  ·  " + (this.camMode == 0 ? "COCKPIT" : (this.camMode == 1 ? "CHASE" : "SHOWROOM")) + "  ·  " + (this.nightT > 0.5 ? "NIGHT" : "DAY"));
+        let warn = "";
+        if (this.bump > 0.2) {
+            warn = "PROXIMITY";
+        } else if (Math.abs(this.alt - this.altT) > 2) {
+            warn = this.altT > 100 ? "ASCENDING · SKY LANE 140 M" : "DESCENDING · CANYON LANE 62 M";
+        } else if (b >= T_HUD && b < T_GO + 1.2) {
+            warn = "SYSTEMS ONLINE";
+        }
+        this.setS("warn", warn);
+        this.setN("warnOp", warn.length > 0 ? 1 : 0);
+        // boot overlays + staged intros
+        this.setN("uiIn", smooth5((b - T_UI) / 0.8));
+        this.setN("bootBar", clamp(b / T_LOGO_OUT, 0, 1));
+        this.setN("bootCl", b >= T_CL ? 1 : 0);
+        this.setN("bootCs", b >= T_CS ? 1 : 0);
+        this.setN("bootHub", b >= T_HUB ? 1 : 0);
+        this.setN("bootHud", b >= T_HUD ? 1 : 0);
+        this.setLogo("logoHub", b >= T_HUB + 0.2);
+        // billboard logo cycles in / out (its own In / Out animations)
+        let cyc = this.time % 7.0;
+        this.setLogo("logoBB", b > T_POWER && cyc < 5.4);
+    }
+
+    // ------------------------------------------------------------ title screen
+    private updateTitle(d: f64): void {
+        // Rive logo plays in over the city overview, out on ENTER
+        // the logo waits for the city to finish rising
+        this.setLogo("logo", !this.entered && this.loadT >= T_LOGO);
+        // the logo artboard rests in its shown pose; keep it invisible until its play-in is due
+        if (this.loadT >= T_LOGO) {
+            this.logoSeen = true;
+        }
+        this.setN("logoVis", this.logoSeen ? 1 : 0);
+        let ready = this.loadT >= T_TITLE_UI;
+        let tgt: f64 = !this.entered && ready ? 1 : 0;
+        let rate: f64 = tgt > this.enterOp ? 3.0 : 6.0;
+        this.enterOp += (tgt - this.enterOp) * (1 - Math.exp(-d * rate));
+        if (this.enterOp < 0.01 && tgt == 0) {
+            this.enterOp = 0;
+        }
+        this.setN("enterOp", Math.floor(this.enterOp * 100 + 0.5) / 100);
+        this.setN("enterGo", this.entered ? 1 : 0);
+        let lo = this.loadT < 0 ? 1 : 1 - clamp(this.loadT / 0.4, 0, 1);
+        this.setN("loadOp", lo);
+        // black until the city exists, then a 0.6 s fade as it appears (first load only: a return
+        // to the title replays the rise without going dark)
+        if (this.loadT >= 0.5) {
+            // after the rendered city has faded in over the artboard sky (worldOp, 0.8 s)
+            this.blackK = Math.max(0, this.blackK - d / 0.6);
+        }
+        this.setN("blackout", Math.floor(smooth5(this.blackK) * 100 + 0.5) / 100);
+        // title grade + scrim ease out over the first second of the dive
+        this.titleK = this.entered ? Math.max(0, 1 - this.enterT / 1.6) : 1;
+        this.setN("titleOp", Math.floor(smooth5(this.titleK) * 100 + 0.5) / 100);
+        // the rendered city fades in over the artboard sky once it has loaded
+        this.worldOp = this.loadT < 0 ? 0 : smooth5(this.loadT / 0.8);
+    }
+
+    // Title visor: the live "Title FUI" artboard on the inside of a 150 deg cylinder centred on
+    // the camera (r 4 m), wider than the view, so its bands bow toward the screen corners like a
+    // helmet visor. Brow band drops in and sweeps open from the centre; button band springs up
+    // from below and unrolls; both flicker on while the artboard assembles. ENTER: press flash,
+    // brow retracts up, button band drops away, both collapse to the centre.
+    private placeHolo(dt: f64): void {
+        // title CTA (2D, main artboard): build when the city is up, decrypt cue as the cursor types
+        let tb = this.loadT - T_TITLE_UI;
+        this.holoOn = false;
+        this.setN("titleBuild", tb >= 0.35 ? 1 : 0);
+        if (tb < 0.35) {
+            this.holoCued = false;
+        } else if (!this.holoCued && tb >= 1.25) {
+            this.holoCued = true;
+            this.setN("titleCue", this.getN("titleCue") + 1);
+        }
+    }
+
+    private enterCity(): void {
+        if (this.entered || this.loadT < 0) {
+            return;
+        }
+        this.entered = true;
+        this.enterT = 0;
+    }
+
+    private selectTrack(k: i32): void {
+        this.track = ((k % NTRACKS) + NTRACKS) % NTRACKS;
+        this.progress = 0;
+        this.playing = true;
+    }
+
+    private handleRequests(): void {
+        let req = this.getN("req");
+        if (req != 0) {
+            if (req == 60) {
+                this.enterCity();
+            } else if (req == 1) {
+                this.setAutopilot(!this.autopilot);
+            } else if (req == 2) {
+                this.mode = this.mode == 2 ? 0 : 2;
+            } else if (req == 3) {
+                this.nightT = 1 - this.nightT;
+            } else if (req == 4) {
+                this.camMode = this.camMode == 0 ? 1 : 0;
+            } else if (req == 5) {
+                this.mode = (this.mode + 1) % 3;
+            } else if (req >= 70 && req <= 72) {
+                this.setQuality(<i32>req - 70);
+            } else if (req == 80) {
+                this.togglePlay();
+            } else if (req == 6) {
+                this.reboot();
+            } else if (req == 7) {
+                this.camMode = this.camMode == 2 ? 0 : 2;
+            } else if (req >= 10 && req <= 12) {
+                this.mode = <i32>req - 10;
+            } else if (req == 20) {
+                this.taps++;
+                this.hitT = 0.7;
+            } else if (req == 40) {
+                this.playing = !this.playing;
+            } else if (req == 41) {
+                this.selectTrack(this.track + 1);
+            } else if (req == 42) {
+                this.selectTrack(this.track - 1);
+            } else if (req >= 50 && req <= 55) {
+                this.ambient = <i32>req - 50;
+            }
+            // reset directly: the change cache already holds 0
+            let rp = this.numProp("req");
+            if (rp != null) {
+                rp.value = 0;
+            }
+        }
+        // playlist rows write their own `tap`; the script owns the selection
+        let ctx = this.context;
+        if (ctx == null) {
+            return;
+        }
+        let vm = ctx.rootViewModel();
+        if (vm == null) {
+            return;
+        }
+        let list = vm.getList("tracks");
+        if (list == null) {
+            return;
+        }
+        for (let i = 0; i < list.length; i++) {
+            let item = list.get(i);
+            let tpn = item.getNumber("tap");
+            if (tpn != null && tpn.value != 0) {
+                tpn.value = 0;
+                this.selectTrack(i);
+            }
+            let sel = item.getNumber("sel");
+            if (sel != null) {
+                let want: f64 = i == this.track ? 1 : 0;
+                if (sel.value != want) {
+                    sel.value = want;
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ lights (billboards spill onto the street)
+    private updateLights(): void {
+        let e = this.eye;
+        let cands = new Array<Cand>();
+        for (let i = 0; i < this.bbs.length; i++) {
+            let b = this.bbs[i];
+            let dx = <f64>b.c.x - <f64>e.x;
+            let dz = <f64>b.c.z - <f64>e.z;
+            let d2 = dx * dx + dz * dz;
+            if (d2 < 320 * 320) {
+                cands.push(new Cand(d2, b));
+            }
+        }
+        cands.sort((a: Cand, b: Cand): i32 => (a.d < b.d ? -1 : (a.d > b.d ? 1 : 0)));
+        let out = new Array<Light>();
+        let k = this.night * 0.9 + 0.1;
+        for (let i = 0; i < Math.min(16, cands.length); i++) {
+            let b = cands[i].b;
+            let L = new Light();
+            let dd = 4 + b.w * 0.15;
+            L.x = <f64>b.c.x + b.nx * dd;
+            L.y = <f64>b.c.y - b.h * 0.25;
+            L.z = <f64>b.c.z + b.nz * dd;
+            L.r = 26 + b.w * 2.2;
+            L.cr = BB_LIGHT[b.design * 3];
+            L.cg = BB_LIGHT[b.design * 3 + 1];
+            L.cb = BB_LIGHT[b.design * 3 + 2];
+            let pk: f64 = this.powerR > vlen(vsub(b.c, this.origin)) + 30 ? 1 : 0;
+            L.k = k * pk * (1 + b.w / 24);
+            out.push(L);
+        }
+        this.lights = out;
+    }
+
+    // ------------------------------------------------------------ per frame
+    fpsT: f64 = 0;
+    fpsN: i32 = 0;
+    fpsMax: f64 = 0;
+
+    // upload queued facade mips: one mip level per step, ~12 ms per frame
+    private pumpTex(): void {
+        if (this.winQ.length > 0 && this.texJobs.length == 0) {
+            let q = this.winQ.shift();
+            this.context!.decodeImage(q.data, q.dec);
+            return;
+        }
+        let t0 = clock();
+        while (this.texJobs.length > 0 && clock() - t0 < 0.012) {
+            let j = this.texJobs[0];
+            let tex = j.tex;
+            let size = <i32>TexInfo.size;
+            let m = j.mip;
+            if (tex != null && m < j.mips) {
+                let sz = size >> m;
+                let reg = new rive_gpu_texture_upload_v1();
+                reg.mipLevel = <u32>m;
+                reg.layer = j.layer;
+                reg.width = <u32>sz;
+                reg.height = <u32>sz;
+                if (m == 0) {
+                    reg.bytesPerRow = <u32>(j.W * 4);
+                    tex.upload(reg, j.data);
+                } else {
+                    let oy = j.y;
+                    j.y += sz;
+                    let mb = new ArrayBuffer(sz * sz * 4);
+                    for (let row = 0; row < sz; row++) {
+                        Buffer.copy(mb, <f64>(row * sz * 4), j.data, <f64>(((oy + row) * j.W + size) * 4), <f64>(sz * 4));
+                    }
+                    reg.bytesPerRow = 0;
+                    tex.upload(reg, mb);
+                }
+                j.mip = m + 1;
+            }
+            if (tex == null || j.mip >= j.mips) {
+                this.texJobs.shift();
+                this.texDecoded();
+            }
+        }
+    }
+
+    override advance(seconds: f64): bool {
+        this.trySetup();
+        this.pumpTex();
+        // live frame-time log (real elapsed time in the preview window)
+        this.fpsT += seconds;
+        this.fpsN++;
+        this.fpsMax = Math.max(this.fpsMax, seconds);
+        // dynamic resolution: hold ~60 fps; the renderer is fill-rate bound
+        this.dynT += seconds;
+        this.dynN++;
+        this.dynHold -= seconds;
+        if (this.dynT >= 1.0) {
+            let avg = this.dynT / <f64>this.dynN;
+            let want = this.dynScale;
+            if (avg > 0.0175) {
+                want = Math.max(this.dynMin, this.dynScale - 0.125);
+            } else if (avg < 0.0105 && this.dynHold <= 0) {
+                want = Math.min(this.dynMax, this.dynScale + 0.125);
+            }
+            if ((<i32>this.getN("dbgFlags") & 2) != 0) {
+                want = 1.5;     // --data=dbgFlags=2: lock the render scale for A/B timing
+            }
+            if (want != this.dynScale && this.tt > 3) {
+                this.dynScale = want;
+                this.needsResize = true;
+                this.dynHold = 4;
+            }
+            this.dynT = 0;
+            this.dynN = 0;
+        }
+        if (this.fpsT >= 5) {
+            this.log("perf: " + formatFixed(this.fpsT / <f64>this.fpsN * 1000, 2) + " ms avg, " +
+                formatFixed(<f64>this.fpsN / this.fpsT, 1) + " fps, worst " + formatFixed(this.fpsMax * 1000, 1) + " ms, " +
+                formatInt(<f64>this.gw) + "x" + formatInt(<f64>this.gh) + " internal (x" + formatFixed(this.gScale, 3) + ")");
+            this.fpsT = 0;
+            this.fpsN = 0;
+            this.fpsMax = 0;
+        }
+        let d = Math.min(seconds, 1.0 / 20);
+        this.time += d;
+        this.tt += d;
+        // title: hold the boot clock at the dive's opening shot until ENTER
+        this.dbgNoCull = (<i32>this.getN("dbgFlags") & 1) != 0;
+        // bench/debug: --data=benchSkip=1 jumps straight into the drive once the city is loaded
+        if (!this.entered && this.loadT >= 0 && this.getN("benchSkip") > 0) {
+            this.enterCity();
+            this.boot = T_GO + 2;
+        }
+        this.boot = this.entered ? this.boot + d : Math.min(this.boot + d, T_DIVE);
+        if (this.entered) {
+            this.enterT += d;
+        }
+        if (this.city != null) {
+            this.loadT = this.loadT < 0 ? 0 : this.loadT + d;
+        }
+        this.updateTitle(d);
+        this.night += (this.nightT - this.night) * (1 - Math.exp(-d * 2.0));
+        this.hitT = Math.max(0, this.hitT - d);
+        // city rise (behind the title logo) + power waves from the car
+        let rb = this.loadT - 0.35;
+        this.riseR = rb <= 0 ? 0 : 30 + 5200 * Math.pow(rb / 3.4, 1.7);
+        let pb = this.boot - T_POWER;
+        this.powerR = pb <= 0 ? 0 : 20 + 2600 * Math.pow(pb / 4.4, 1.8);
+        // night start screen: the city powers up right behind the rise (windows, neon, screens) instead
+        // of waiting for the car; it stays powered on entering, and replays on a return to the title
+        if (!this.entered) {
+            this.titlePow = this.nightT > 0.5 ? Math.max(0, this.riseR - 250) : 0;
+        }
+        this.powerR = Math.max(this.powerR, this.titlePow);
+        // ambient colour eases
+        this.ambC = mix3(this.ambC, hex(AMB_HEX[this.ambient]), 1 - Math.exp(-d * 5));
+        // media clock
+        if (this.playing) {
+            this.progress += d;
+            if (this.progress >= TRACK_DUR[this.track]) {
+                this.selectTrack(this.track + 1);
+            }
+        }
+        if (this.city == null) {
+            return true;
+        }
+        this.handleRequests();
+        this.drive(d);
+        this.simNpcs(d);
+        this.updateCamera(d);
+        this.placeCockpit();
+        this.placeHolo(d);
+        this.updateLights();
+        this.updateMarkers(d);
+        this.updateTrackers(d);
+        this.declutterHud(d);
+        this.writeTelemetry();
+        for (let k = 0; k < this.surfs.length; k++) {
+            let sf = this.surfs[k];
+            let inst = sf.inst;
+            if (inst != null) {
+                if (k > 3) {
+                    // billboards: sf.live is set by draw()'s exact frustum test (last frame). Hidden
+                    // ones don't advance; they catch up (capped) when they come back into view.
+                    if (sf.live) {
+                        inst.advance(Math.min(seconds + sf.pending, 0.25));
+                        sf.pending = 0;
+                    } else {
+                        sf.pending = Math.min(sf.pending + seconds, 0.25);
+                    }
+                } else {
+                    // cockpit surfaces only matter near the car
+                    sf.live = vlen(vsub(this.eye, this.carPos)) < 40;
+                    if (sf.live) {
+                        inst.advance(seconds);
+                    }
+                }
+            }
+        }
+        return true;
+    }
+

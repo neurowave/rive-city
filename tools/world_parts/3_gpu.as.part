@@ -1,0 +1,715 @@
+    // ------------------------------------------------------------ GPU
+    texDecoded(): void {
+        this.texPending--;
+        if (this.texPending == 0) {
+            let vd = new GPUTextureViewDesc();
+            vd.dimension = TextureViewDimension.array2D;
+            let a = this.albTex;
+            let n = this.nrmTex;
+            if (a != null && n != null) {
+                this.albV = a.view(vd);
+                this.nrmV = n.view(vd);
+
+                this.texReady = true;
+                this.rebuildBindGroups();
+                this.log("world: facade textures ready");
+            }
+        }
+    }
+
+    // facade photos: JPEG mip-chain atlases packed by tools/make_tex.py
+    private loadTextures(): void {
+        let ctx = this.context!;
+        let data = ctx.blob("tex");
+        if (data == null) {
+            this.log("world: tex blob missing");
+            return;
+        }
+        let count = <i32>Buffer.readu32(data, 0);
+        let size = <u32>Buffer.readu32(data, 4);
+        let mips = <u32>Buffer.readu32(data, 8);
+        let layers = count / 2;
+        let td = new GPUTextureDesc();
+        td.width = size;
+        td.height = size;
+        td.depthOrArrayLayers = <u32>layers;
+        td.textureType = TextureType.array2D;
+        td.numMipmaps = mips;
+        let alb = new GPUTexture(td);
+        // the normal array also carries the window maps as extra layers (layers .. 2 * layers - 1, mip 0
+        // only): the bind group has no spare texture slot (0-7)
+        let wdata = ctx.blob("win");
+        let wcount = wdata == null ? 0 : <i32>Buffer.readu32(wdata!, 0);
+        let tdn = new GPUTextureDesc();
+        tdn.width = size;
+        tdn.height = size;
+        tdn.depthOrArrayLayers = <u32>(layers + wcount);
+        tdn.textureType = TextureType.array2D;
+        tdn.numMipmaps = mips;
+        let nrm = new GPUTexture(tdn);
+        this.albTex = alb;
+        this.nrmTex = nrm;
+        // window maps: same container, PNG, mip 0 only, into the normal array's extra layers
+        if (wdata != null && wcount > 0) {
+            for (let k = 0; k < wcount; k++) {
+                let off = <i32>Buffer.readu32(wdata!, <f64>(12 + k * 8));
+                let len = <i32>Buffer.readu32(wdata!, <f64>(16 + k * 8));
+                // first half: window maps (mip 0); second half: lit-window masks (mip-chain atlases)
+                let mapHalf = wcount / 2;
+                // PNG decodes are heavier than the JPEGs: queue them, one per frame (pumpTex)
+                this.winQ.push(new WinDec(wdata!.slice(off, off + len), new TexDecode(this, nrm, <u32>(layers + k), k < mapHalf ? 1 : <i32>mips)));
+            }
+        }
+        this.texPending = count + (wdata != null ? wcount : 0);
+        for (let k = 0; k < count; k++) {
+            let off = <i32>Buffer.readu32(data, <f64>(12 + k * 8));
+            let len = <i32>Buffer.readu32(data, <f64>(16 + k * 8));
+            let jb = data.slice(off, off + len);
+            let tex = k < layers ? alb : nrm;
+            ctx.decodeImage(jb, new TexDecode(this, tex, <u32>(k % layers)));
+        }
+    }
+
+    private dummyArray(): GPUTextureView {
+        return this.dummyArrayFill(150);
+    }
+
+    private dummyArrayFill(v: u8): GPUTextureView {
+        let td = new GPUTextureDesc();
+        td.width = 4;
+        td.height = 4;
+        td.depthOrArrayLayers = <u32>(TexInfo.layers * 3);    // + window maps + lit masks
+        td.textureType = TextureType.array2D;
+        let t = new GPUTexture(td);
+        let white = new ArrayBuffer(64);
+        Buffer.fill(white, 0, v);
+        for (let l = 0; l < TexInfo.layers * 3; l++) {
+            let reg = new rive_gpu_texture_upload_v1();
+            reg.layer = <u32>l;
+            reg.width = 4;
+            reg.height = 4;
+            t.upload(reg, white);
+        }
+        let vd = new GPUTextureViewDesc();
+        vd.dimension = TextureViewDimension.array2D;
+        return t.view(vd);
+    }
+
+    private depthTex(w: u32, h: u32, samples: u32): GPUTexture {
+        let td = new GPUTextureDesc();
+        td.width = w;
+        td.height = h;
+        td.format = TextureFormat.depth32float;
+        td.renderTarget = true;
+        td.sampleCount = samples;
+        return new GPUTexture(td);
+    }
+
+    private hdrTex(w: u32, h: u32, samples: u32): GPUTexture {
+        let td = new GPUTextureDesc();
+        td.width = w;
+        td.height = h;
+        td.format = TextureFormat.rgba16float;
+        td.renderTarget = true;
+        td.sampleCount = samples;
+        return new GPUTexture(td);
+    }
+
+    private depthOnly(t: GPUTexture): GPUTextureView {
+        let vd = new GPUTextureViewDesc();
+        vd.aspect = TextureAspect.depthOnly;
+        return t.view(vd);
+    }
+
+    private createGPU(): bool {
+        let ctx = this.context!;
+        let gpu = ctx.gpuCanvas();
+        if (gpu == null) {
+            return false;
+        }
+        this.gpu = gpu;
+        this.linSampler = new GPUSampler(Filter.linear, Filter.linear, Filter.nearest, WrapMode.clampToEdge, WrapMode.clampToEdge);
+        this.texSampler = new GPUSampler(Filter.linear, Filter.linear, Filter.linear, WrapMode.repeat, WrapMode.repeat,
+            <CompareFunction>0xFFFFFFFF, 8);
+        let c = this.city!;
+        let p = this.props!;
+        // split over two frames: each host callback has its own 200 ms watchdog
+        if (this.gpuStage == 0) {
+            c.upload();
+            this.gpuStage = 1;
+            return false;
+        }
+        if (this.gpuStage == 1) {
+            p.upload();
+            this.gpuStage = 2;
+            return false;
+        }
+        if (this.gpuStage == 2) {
+        for (let i = 0; i < this.objs.length; i++) {
+            this.objs[i].ubo = new GPUBuffer(BufferUsage.uniform, UBO_SIZE);
+        }
+        this.frameMain = new GPUBuffer(BufferUsage.uniform, FRAME_SIZE);
+        this.frameRefl = new GPUBuffer(BufferUsage.uniform, FRAME_SIZE);
+        this.frameCab = new GPUBuffer(BufferUsage.uniform, FRAME_SIZE);
+        this.frameShadow = new GPUBuffer(BufferUsage.uniform, FRAME_SIZE);
+        this.dummyUbo = new GPUBuffer(BufferUsage.uniform, UBO_SIZE);
+        this.dummyV = this.hdrTex(4, 4, 1).view();
+        this.albV = this.dummyArray();
+        this.nrmV = this.dummyArray();
+
+        // shadow atlas: city map [0, N) x [0, N), car map [N, N + CAR_SN) x [0, CAR_SN)
+        let st = this.depthTex(SHADOW_N + CAR_SN, SHADOW_N, 1);
+        this.shadowV = this.depthOnly(st);
+        this.shadowAttV = st.view();
+        this.shadowDummyV = this.depthOnly(this.depthTex(4, 4, 1));
+        this.frameCarShadow = new GPUBuffer(BufferUsage.uniform, FRAME_SIZE);
+        this.envUbo = new GPUBuffer(BufferUsage.uniform, 16);
+            this.loadTextures();
+            this.gpuStage = 3;
+            return false;
+        }
+        if (this.gpuStage == 3) {
+            // swarm instances come precomputed in the city pack (tools/make_city.py)
+            let hoi = this.cm("holo_inst");
+            if (hoi != null && hoi.vbuf != null) {
+                this.holoBuf = hoi.vbuf;
+                this.holoN = hoi.vcount;
+                this.log("world: holo signs " + hoi.vcount.toString());
+            }
+            let sti = this.cm("steam_inst");
+            if (sti != null && sti.vbuf != null) {
+                this.steamBuf = sti.vbuf;
+                this.steamN = sti.vcount;
+                this.log("world: steam " + sti.vcount.toString() + " vents");
+            }
+            let si = this.cm("swarm_inst");
+            if (si != null && si.vbuf != null) {
+                this.swarmBuf = si.vbuf;
+                this.swarmN = si.vcount;
+                // CPU copy for the HUD trackers (same maths as vs_swarm)
+                let nf = <i32>si.vcount * 8;
+                let cpu = new StaticArray<f32>(nf);
+                for (let q = 0; q < nf; q++) {
+                    cpu[q] = <f32>Buffer.readf32(si.src, <f64>si.vOff + <f64>q * 4);
+                }
+                this.swCpu = cpu;
+                this.log("world: swarm " + si.vcount.toString() + " cars");
+            } else {
+                this.buildSwarm();
+            }
+            this.gpuStage = 4;
+            return false;
+        }
+        for (let i = 0; i < this.surfs.length; i++) {
+            let sf = this.surfs[i];
+            sf.canvas = ctx.canvas(<u32>Math.floor(sf.w * sf.density), <u32>Math.floor(sf.h * sf.density));
+        }
+        return true;
+    }
+
+    // swarm: thousands of hovercars streaming down every canyon at stacked altitudes
+    private buildSwarm(): void {
+        let heights: StaticArray<f64> = [14, 24, 36, 47, 76, 88, 100, 116, 160, 178, 200, 230, 265, 300];
+        let lo = <f64>City.LO * P;
+        let hi = <f64>City.HI * P;
+        let len = hi - lo;
+        let MAXN = 9000;
+        let inst = new ArrayBuffer(MAXN * 32);
+        let f = new Float32Array(MAXN * 8);
+        let n = 0;
+        let rs: f64 = 1;
+        for (let axis = 0; axis < 2; axis++) {
+            for (let li = City.LO; li <= City.HI; li++) {
+                let line = <f64>li * P;
+                for (let hk = 0; hk < heights.length; hk++) {
+                    for (let side = -1; side <= 1; side += 2) {
+                        rs = (rs * 16807) % 2147483647;
+                        let cnt = 4 + <i32>Math.floor(rs / 2147483647 * 8);
+                        rs = (rs * 16807) % 2147483647;
+                        let off = <f64>side * (3 + rs / 2147483647 * 6);
+                        rs = (rs * 16807) % 2147483647;
+                        let spd = 22 + rs / 2147483647 * 26;
+                        rs = (rs * 16807) % 2147483647;
+                        let yy = heights[hk] + rs / 2147483647 * 3;
+                        for (let q = 0; q < cnt; q++) {
+                            if (n < MAXN) {
+                                let o = n * 8;
+                                let cx = axis == 0 ? (lo + hi) / 2 : line + off;
+                                let cz = axis == 0 ? line + off : (lo + hi) / 2;
+                                rs = (rs * 16807) % 2147483647;
+                                let sv = spd * (0.92 + rs / 2147483647 * 0.16);
+                                rs = (rs * 16807) % 2147483647;
+                                // scatter around the lane so traffic fills the canyon volume
+                                rs = (rs * 16807) % 2147483647;
+                                let jy = (rs / 2147483647 - 0.5) * 9;
+                                rs = (rs * 16807) % 2147483647;
+                                let jl = (rs / 2147483647 - 0.5) * 4;
+                                f[o] = <f32>(cx + (axis == 1 ? jl : 0));
+                                f[o + 1] = <f32>(yy + jy);
+                                f[o + 2] = <f32>(cz + (axis == 0 ? jl : 0));
+                                f[o + 3] = <f32>sv;
+                                f[o + 4] = <f32>axis;
+                                f[o + 5] = <f32>side;
+                                f[o + 6] = <f32>len;
+                                f[o + 7] = <f32>(rs / 2147483647);
+                                n++;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let bytes = f.buffer.slice(0, n * 32);
+        this.swarmBuf = new GPUBuffer(BufferUsage.vertex, <u32>(n * 32), bytes, true);
+        this.swarmN = <u32>n;
+        this.log("world: swarm " + n.toString() + " cars");
+        inst = bytes;
+    }
+
+    private layout32(): GPUVertexBufferLayout {
+        let l = new GPUVertexBufferLayout();
+        l.stride = 32;
+        l.attributes = [
+            new GPUVertexAttribute(VertexFormat.float3, 0, 0),
+            new GPUVertexAttribute(VertexFormat.float3, 1, 12),
+            new GPUVertexAttribute(VertexFormat.float2, 2, 24),
+        ];
+        return l;
+    }
+
+    private depthState(write: bool): GPUDepthStencilDesc {
+        let d = new GPUDepthStencilDesc();
+        d.format = TextureFormat.depth32float;
+        d.compare = CompareFunction.lessEqual;
+        d.write = write;
+        return d;
+    }
+
+    private target(fmt: TextureFormat, blend: GPUBlendState?): GPUColorTargetDesc {
+        let t = new GPUColorTargetDesc();
+        t.format = fmt;
+        t.blend = blend;
+        return t;
+    }
+
+    private pipe(lit: GPUShaderModule, vs: string, fs: string, vtx: Array<GPUVertexBufferLayout>, color: Array<GPUColorTargetDesc>,
+                 depth: GPUDepthStencilDesc?, cull: CullMode, samples: u32, shared: bool): GPUPipeline {
+        let d = new GPUPipelineDesc();
+        d.vertexModule = lit;
+        d.vertexEntryPoint = vs;
+        if (fs.length > 0) {
+            d.fragmentModule = lit;
+            d.fragmentEntryPoint = fs;
+        }
+        d.vertexBuffers = vtx;
+        d.colorTargets = color;
+        d.depthStencil = depth;
+        d.cullMode = cull;
+        d.sampleCount = samples;
+        if (shared) {
+            d.bindGroupLayouts = [this.bgl];
+        }
+        return new GPUPipeline(d);
+    }
+
+    private makePipelines(): bool {
+        let ctx = this.context!;
+        let lit = ctx.shader("lit");
+        let brS = ctx.shader("bright");
+        let blS = ctx.shader("blur");
+        let fiS = ctx.shader("final");
+        let taS = ctx.shader("taa");
+        if (lit == null || brS == null || blS == null || fiS == null || taS == null) {
+            this.log("world: shader missing lit=" + (lit == null ? "NULL" : "ok") + " bright=" + (brS == null ? "NULL" : "ok") +
+                " blur=" + (blS == null ? "NULL" : "ok") + " final=" + (fiS == null ? "NULL" : "ok") + " taa=" + (taS == null ? "NULL" : "ok"));
+            return false;
+        }
+        this.bgl = GPUBindGroupLayout.fromShader(lit, 0);
+        let L = [this.layout32()];
+        let HDR = TextureFormat.rgba16float;
+        let dW = this.depthState(true);
+        let dR = this.depthState(false);
+        this.litMS = this.pipe(lit, "vs_main", "fs_main", L, [this.target(HDR, null)], dW, CullMode.none, 4, true);
+        this.litMSCull = this.pipe(lit, "vs_main", "fs_main", L, [this.target(HDR, null)], dW, CullMode.back, 4, true);
+        this.litR = this.pipe(lit, "vs_main", "fs_main", L, [this.target(HDR, null)], dW, CullMode.none, 1, true);
+        let keep = new GPUBlendState();
+        keep.srcColor = BlendFactor.zero;
+        keep.dstColor = BlendFactor.one;
+        keep.srcAlpha = BlendFactor.zero;
+        keep.dstAlpha = BlendFactor.one;
+        this.depthMS = this.pipe(lit, "vs_main", "fs_depth", L, [this.target(HDR, keep)], dW, CullMode.none, 4, true);
+        let inst = new GPUVertexBufferLayout();
+        inst.stride = 32;
+        inst.stepMode = VertexStepMode.instance;
+        inst.attributes = [new GPUVertexAttribute(VertexFormat.float4, 3, 0), new GPUVertexAttribute(VertexFormat.float4, 4, 16)];
+        this.swarmPipe = this.pipe(lit, "vs_swarm", "fs_swarm", [this.layout32(), inst], [this.target(HDR, null)], dW, CullMode.back, 4, true);
+        this.shadowPipe = this.pipe(lit, "vs_main", "", L, [], this.depthState(true), CullMode.none, 1, true);
+        let ginst = new GPUVertexBufferLayout();
+        ginst.stride = 32;
+        ginst.stepMode = VertexStepMode.instance;
+        ginst.attributes = [new GPUVertexAttribute(VertexFormat.float4, 3, 0), new GPUVertexAttribute(VertexFormat.float4, 4, 16)];
+        this.greebleMS = this.pipe(lit, "vs_greeble", "fs_greeble", [this.layout32(), ginst], [this.target(HDR, null)], dW, CullMode.back, 4, true);
+        let ginst2 = new GPUVertexBufferLayout();
+        ginst2.stride = 32;
+        ginst2.stepMode = VertexStepMode.instance;
+        ginst2.attributes = [new GPUVertexAttribute(VertexFormat.float4, 3, 0), new GPUVertexAttribute(VertexFormat.float4, 4, 16)];
+        this.greebleShadow = this.pipe(lit, "vs_greeble", "", [this.layout32(), ginst2], [], this.depthState(true), CullMode.none, 1, true);
+        let always = new GPUDepthStencilDesc();
+        always.format = TextureFormat.depth32float;
+        always.compare = CompareFunction.always;
+        always.write = true;
+        this.clearPipe = this.pipe(lit, "vs_clear", "", [], [], always, CullMode.none, 1, true);
+        this.skyMS = this.pipe(lit, "vs_sky", "fs_sky", [], [this.target(HDR, null)], dR, CullMode.none, 4, true);
+        this.skyR = this.pipe(lit, "vs_sky", "fs_sky", [], [this.target(HDR, null)], dR, CullMode.none, 1, true);
+        let add = new GPUBlendState();
+        add.srcColor = BlendFactor.one;
+        add.dstColor = BlendFactor.one;
+        add.srcAlpha = BlendFactor.zero;
+        add.dstAlpha = BlendFactor.one;
+        this.rainMS = this.pipe(lit, "vs_rain", "fs_rain", [], [this.target(HDR, add)], dR, CullMode.none, 4, true);
+        // steam: premultiplied over, alpha (encoded distance) untouched
+        let pre = new GPUBlendState();
+        pre.srcColor = BlendFactor.one;
+        pre.dstColor = BlendFactor.oneMinusSrcAlpha;
+        pre.srcAlpha = BlendFactor.zero;
+        pre.dstAlpha = BlendFactor.one;
+        let sinst = new GPUVertexBufferLayout();
+        sinst.stride = 32;
+        sinst.stepMode = VertexStepMode.instance;
+        sinst.attributes = [new GPUVertexAttribute(VertexFormat.float4, 3, 0), new GPUVertexAttribute(VertexFormat.float4, 4, 16)];
+        this.steamMS = this.pipe(lit, "vs_steam", "fs_steam", [sinst], [this.target(HDR, pre)], dR, CullMode.none, 4, true);
+        this.holoMS = this.pipe(lit, "vs_holo", "fs_holo", [sinst], [this.target(HDR, add)], dR, CullMode.none, 4, true);
+        let add2 = new GPUBlendState();
+        add2.srcColor = BlendFactor.one;
+        add2.dstColor = BlendFactor.one;
+        add2.srcAlpha = BlendFactor.zero;
+        add2.dstAlpha = BlendFactor.one;
+        this.coneMS = this.pipe(lit, "vs_main", "fs_cone", L, [this.target(HDR, add2)], dR, CullMode.none, 4, true);
+        let over = new GPUBlendState();
+        over.srcColor = BlendFactor.one;
+        over.dstColor = BlendFactor.oneMinusSrcAlpha;
+        over.srcAlpha = BlendFactor.zero;
+        over.dstAlpha = BlendFactor.one;
+        this.glassMS = this.pipe(lit, "vs_main", "fs_glass", L, [this.target(HDR, over)], dR, CullMode.none, 4, true);
+        let hudB = new GPUBlendState();
+        hudB.srcColor = BlendFactor.one;
+        hudB.dstColor = BlendFactor.one;
+        hudB.srcAlpha = BlendFactor.one;
+        hudB.dstAlpha = BlendFactor.one;
+        hudB.alphaOp = BlendOp.min;
+        this.hudMS = this.pipe(lit, "vs_main", "fs_glass", L, [this.target(HDR, hudB)], dR, CullMode.none, 4, true);
+        // title holo backing: multiply (smoked glass) + min alpha (TAA cockpit tag)
+        let mulB = new GPUBlendState();
+        mulB.srcColor = BlendFactor.zero;
+        mulB.dstColor = BlendFactor.srcColor;
+        mulB.srcAlpha = BlendFactor.one;
+        mulB.dstAlpha = BlendFactor.one;
+        mulB.alphaOp = BlendOp.min;
+        this.holoBackMS = this.pipe(lit, "vs_main", "fs_glass", L, [this.target(HDR, mulB)], dR, CullMode.none, 4, true);
+        this.brightPipe = this.pipe(brS, "vs_full", "fs_bright", [], [this.target(HDR, null)], null, CullMode.none, 1, false);
+        this.blurPipe = this.pipe(blS, "vs_full", "fs_blur", [], [this.target(HDR, null)], null, CullMode.none, 1, false);
+        let gpu = this.gpu!;
+        this.finalPipe = this.pipe(fiS, "vs_full", "fs_final", [], [this.target(<TextureFormat>gpu.format, null)], null, CullMode.none, 1, false);
+        this.downUbos = [];
+        for (let i = 0; i < 3; i++) {
+            this.downUbos.push(new GPUBuffer(BufferUsage.uniform, 16));
+        }
+        this.blUbos = [];
+        for (let i = 0; i < 6; i++) {
+            this.blUbos.push(new GPUBuffer(BufferUsage.uniform, 16));
+        }
+        this.finUbo = new GPUBuffer(BufferUsage.uniform, 96);
+        let shS = ctx.shader("shafts");
+        if (shS != null) {
+            this.shaftPipe = this.pipe(shS!, "vs_full", "fs_shafts", [], [this.target(HDR, null)], null, CullMode.none, 1, false);
+            this.shaftUbo = new GPUBuffer(BufferUsage.uniform, 16);
+        }
+        this.taaPipe = this.pipe(taS!, "vs_full", "fs_taa", [], [this.target(HDR, null)], null, CullMode.none, 1, false);
+        this.taaUbo = new GPUBuffer(BufferUsage.uniform, 160);
+        return true;
+    }
+
+    private objBG(ubo: GPUBuffer, frame: GPUBuffer, tv: GPUTextureView, rv: GPUTextureView, shadowPass: bool): GPUBindGroup {
+        return new GPUBindGroup(this.bgl!,
+            [new GPUBindGroupUBO(0, ubo), new GPUBindGroupUBO(3, frame)],
+            [
+                new GPUBindGroupTexture(1, tv),
+                new GPUBindGroupTexture(4, rv),
+                new GPUBindGroupTexture(5, this.albV!),
+                new GPUBindGroupTexture(6, this.nrmV!),
+                new GPUBindGroupTexture(7, shadowPass ? this.shadowDummyV! : this.shadowV!),
+            ],
+            [new GPUBindGroupSampler(2, this.texSampler!)]);
+    }
+
+    private casts(o: Obj): bool {
+        return o.pass == 1 && (o.mode == 2 || o.id == 9 || o.id == 10);
+    }
+
+    rebuildBindGroups(): void {
+        if (this.bgl == null || this.frameMain == null || this.dummyV == null) {
+            return;
+        }
+        let views = new Array<GPUTextureView?>(this.surfs.length + 1);
+        for (let i = 0; i < this.surfViews.length; i++) {
+            this.surfViews[i].release();
+        }
+        this.surfViews = [];
+        for (let k = 0; k < this.surfs.length; k++) {
+            let c = this.surfs[k].canvas;
+            if (c != null) {
+                let sv = c.image.view()!;
+                this.surfViews.push(sv);
+                views[k + 1] = sv;
+            }
+        }
+        let fallback = views[1];
+        if (fallback == null) {
+            return;
+        }
+        let dummy = this.dummyV!;
+        let rv = this.reflV;
+        let reflV = rv != null ? rv : dummy;
+        let fm = this.frameMain!;
+        let fr = this.frameRefl!;
+        let fc = this.frameCab!;
+        let fs = this.frameShadow!;
+        let fcs = this.frameCarShadow!;
+        let ev = this.envV;
+        let envV = ev != null ? ev : dummy;
+        // release the previous set: every rebuild/resize used to leak ~800 GPU handles
+        for (let i = 0; i < this.objs.length; i++) {
+            let o = this.objs[i];
+            relBG(o.bg);
+            relBG(o.bgR);
+            relBG(o.bgC);
+            relBG(o.bgS);
+            relBG(o.bgCS);
+            o.bg = null;
+            o.bgR = null;
+            o.bgC = null;
+            o.bgS = null;
+            o.bgCS = null;
+        }
+        relBG(this.skyBG);
+        relBG(this.skyRBG);
+        relBG(this.shadowSkyBG);
+        for (let i = 0; i < this.objs.length; i++) {
+            let o = this.objs[i];
+            let tv = fallback;
+            if (o.tex > 0 && o.tex < views.length) {
+                let vv = views[o.tex];
+                if (vv != null) {
+                    tv = vv;
+                }
+            }
+            let ubo = o.ubo!;
+            let road = o.mode == 3 || o.mode == 4 || o.mode == 13;
+            o.bg = this.objBG(ubo, fm, tv, road ? reflV : (o.envMap ? envV : dummy), false);
+            if (o.refl) {
+                o.bgR = this.objBG(ubo, fr, tv, dummy, false);
+            }
+            if (o.pass >= 2) {
+                o.bgC = this.objBG(ubo, fc, tv, dummy, false);
+            }
+            if (this.casts(o)) {
+                o.bgS = this.objBG(ubo, fs, tv, dummy, true);
+            }
+            if (o.castCar) {
+                o.bgCS = this.objBG(ubo, fcs, tv, dummy, true);
+            }
+        }
+        let du = this.dummyUbo!;
+        this.skyBG = this.objBG(du, fm, fallback, dummy, false);
+        this.skyRBG = this.objBG(du, fr, fallback, dummy, false);
+        this.shadowSkyBG = this.objBG(du, fs, fallback, dummy, true);
+    }
+
+    private postBG(pipe: GPUPipeline, ubo: GPUBuffer, src: GPUTextureView): GPUBindGroup {
+        return new GPUBindGroup(pipe.getBindGroupLayout(0), [new GPUBindGroupUBO(0, ubo)], [new GPUBindGroupTexture(1, src)],
+            [new GPUBindGroupSampler(2, this.linSampler!)]);
+    }
+
+    private rtTexs: Array<GPUTexture> = [];
+    private surfViews: Array<GPUTextureView> = [];
+    private rtViews: Array<GPUTextureView> = [];
+    private rtBGs: Array<GPUBindGroup> = [];
+
+    private rtH(w: u32, h: u32, samples: u32): GPUTexture {
+        let t = this.hdrTex(w, h, samples);
+        this.rtTexs.push(t);
+        return t;
+    }
+
+    private rtD(w: u32, h: u32, samples: u32): GPUTexture {
+        let t = this.depthTex(w, h, samples);
+        this.rtTexs.push(t);
+        return t;
+    }
+
+    private rtV(t: GPUTexture): GPUTextureView {
+        let v = t.view();
+        this.rtViews.push(v);
+        return v;
+    }
+
+    private rtDV(t: GPUTexture): GPUTextureView {
+        let v = this.depthOnly(t);
+        this.rtViews.push(v);
+        return v;
+    }
+
+    private rtBG(b: GPUBindGroup): GPUBindGroup {
+        this.rtBGs.push(b);
+        return b;
+    }
+
+    private doResize(): void {
+        let gpu = this.gpu;
+        if (gpu == null) {
+            return;
+        }
+        let scale = this.hostScale;
+        this.outScale = clamp(Math.max(scale, 1.0), 1, 2);
+        // MSAA 4x on top of this; 1.5x on Retina is plenty
+        this.gScale = Math.min(this.dynScale, scale > 1.5 ? scale : 1.25);
+        let ow = <u32>Math.max(1, Math.floor(this.sizeX * this.outScale));
+        let oh = <u32>Math.max(1, Math.floor(this.sizeY * this.outScale));
+        this.gw = <i32>Math.max(4, Math.floor(this.sizeX * this.gScale));
+        this.gh = <i32>Math.max(4, Math.floor(this.sizeY * this.gScale));
+        gpu.resize(ow, oh);
+        if (this.litMS == null) {
+            if (!this.makePipelines()) {
+                return;
+            }
+        }
+        // free the previous size's targets + bind groups (each dynamic-resolution
+        // step used to leak every render target: hundreds of MB at Retina)
+        for (let i = 0; i < this.rtBGs.length; i++) {
+            this.rtBGs[i].release();
+        }
+        for (let i = 0; i < this.rtViews.length; i++) {
+            this.rtViews[i].release();
+        }
+        for (let i = 0; i < this.rtTexs.length; i++) {
+            this.rtTexs[i].release();
+        }
+        this.rtBGs = [];
+        this.rtViews = [];
+        this.rtTexs = [];
+        let gw = <u32>this.gw;
+        let gh = <u32>this.gh;
+        this.hdrMSV = this.rtV(this.rtH(gw, gh, 4));
+        this.depthMSV = this.rtDV(this.rtD(gw, gh, 4));
+        this.hdrV = this.rtV(this.rtH(gw, gh, 1));
+        this.rw = <i32>Math.max(2, Math.floor(<f64>gw / this.reflDiv));
+        this.rh = <i32>Math.max(2, Math.floor(<f64>gh / this.reflDiv));
+        this.reflV = this.rtV(this.rtH(<u32>this.rw, <u32>this.rh, 1));
+        this.reflDepthV = this.rtDV(this.rtD(<u32>this.rw, <u32>this.rh, 1));
+        this.b1w = <i32>Math.max(2, gw / 4);
+        this.b1h = <i32>Math.max(2, gh / 4);
+        this.b2w = <i32>Math.max(2, gw / 8);
+        this.b2h = <i32>Math.max(2, gh / 8);
+        this.b3w = <i32>Math.max(2, gw / 16);
+        this.b3h = <i32>Math.max(2, gh / 16);
+        this.b1V = this.rtV(this.rtH(<u32>this.b1w, <u32>this.b1h, 1));
+        this.b1tV = this.rtV(this.rtH(<u32>this.b1w, <u32>this.b1h, 1));
+        this.b2V = this.rtV(this.rtH(<u32>this.b2w, <u32>this.b2h, 1));
+        this.b2tV = this.rtV(this.rtH(<u32>this.b2w, <u32>this.b2h, 1));
+        this.b3V = this.rtV(this.rtH(<u32>this.b3w, <u32>this.b3h, 1));
+        this.b3tV = this.rtV(this.rtH(<u32>this.b3w, <u32>this.b3h, 1));
+        this.envV = this.rtV(this.rtH(<u32>this.b1w, <u32>this.b1h, 1));
+        this.shaftV = this.rtV(this.rtH(<u32>this.b1w, <u32>this.b1h, 1));
+        if (this.shaftPipe != null) {
+            this.shaftBG = this.rtBG(this.postBG(this.shaftPipe!, this.shaftUbo!, this.hdrV!));
+        }
+        this.envFrames = 0;
+        this.rebuildBindGroups();
+        let bp = this.brightPipe!;
+        let lp = this.blurPipe!;
+        this.downBGs = [
+            this.rtBG(this.postBG(bp, this.downUbos[0], this.hdrV!)),
+            this.rtBG(this.postBG(bp, this.downUbos[1], this.b1V!)),
+            this.rtBG(this.postBG(bp, this.downUbos[2], this.b2V!)),
+        ];
+        this.blBGs = [
+            this.rtBG(this.postBG(lp, this.blUbos[0], this.b1V!)),
+            this.rtBG(this.postBG(lp, this.blUbos[1], this.b1tV!)),
+            this.rtBG(this.postBG(lp, this.blUbos[2], this.b2V!)),
+            this.rtBG(this.postBG(lp, this.blUbos[3], this.b2tV!)),
+            this.rtBG(this.postBG(lp, this.blUbos[4], this.b3V!)),
+            this.rtBG(this.postBG(lp, this.blUbos[5], this.b3tV!)),
+        ];
+        this.envBG = this.rtBG(this.postBG(bp, this.envUbo!, this.hdrV!));
+        let fp = this.finalPipe!;
+        this.finBG = this.rtBG(new GPUBindGroup(fp.getBindGroupLayout(0), [new GPUBindGroupUBO(0, this.finUbo!)],
+            [
+                new GPUBindGroupTexture(1, this.hdrV!),
+                new GPUBindGroupTexture(2, this.b1V!),
+                new GPUBindGroupTexture(3, this.b2V!),
+                new GPUBindGroupTexture(4, this.b3V!),
+                new GPUBindGroupTexture(6, this.shaftV!),
+            ],
+            [new GPUBindGroupSampler(5, this.linSampler!)]));
+        // TAA ping-pong: taaV[k] is written from hdrV + history taaV[1 - k]
+        this.taaV = [this.rtV(this.rtH(gw, gh, 1)), this.rtV(this.rtH(gw, gh, 1))];
+        let tp_ = this.taaPipe!;
+        this.taaBG = [];
+        this.finBGs = [];
+        for (let k = 0; k < 2; k++) {
+            this.taaBG.push(this.rtBG(new GPUBindGroup(tp_.getBindGroupLayout(0), [new GPUBindGroupUBO(0, this.taaUbo!)],
+                [new GPUBindGroupTexture(1, this.hdrV!), new GPUBindGroupTexture(2, this.taaV[1 - k])],
+                [new GPUBindGroupSampler(3, this.linSampler!)])));
+            this.finBGs.push(this.rtBG(new GPUBindGroup(fp.getBindGroupLayout(0), [new GPUBindGroupUBO(0, this.finUbo!)],
+                [
+                    new GPUBindGroupTexture(1, this.taaV[k]),
+                    new GPUBindGroupTexture(2, this.b1V!),
+                    new GPUBindGroupTexture(3, this.b2V!),
+                    new GPUBindGroupTexture(4, this.b3V!),
+                    new GPUBindGroupTexture(6, this.shaftV!),
+                ],
+                [new GPUBindGroupSampler(5, this.linSampler!)])));
+        }
+        this.taaValid = false;
+    }
+
+    private trySetup(): void {
+        let t0 = clock();
+        let st = this.loadStage;
+        let done = this.stageLoad();
+        if (st < 5) {
+            this.log("load: stage " + st.toString() + " " + ((clock() - t0) * 1000).toString() + " ms");
+        }
+        if (!done) {
+            return;
+        }
+        if (this.city == null || this.context == null) {
+            return;
+        }
+        if (!this.gpuReady) {
+            let t1 = clock();
+            let gs = this.gpuStage;
+            let ok = this.createGPU();
+            this.log("load: createGPU." + gs.toString() + " " + ((clock() - t1) * 1000).toString() + " ms");
+            if (!ok) {
+                return;
+            }
+            this.gpuReady = true;
+            this.needsResize = true;
+        }
+        if (this.needsResize && this.sizeX > 0) {
+            this.needsResize = false;
+            let t2 = clock();
+            this.doResize();
+            this.log("load: resize " + ((clock() - t2) * 1000).toString() + " ms");
+        }
+    }
+
+    override resize(width: f64, height: f64, scale: f64): void {
+        this.sizeX = width;
+        this.sizeY = height;
+        this.hostScale = scale;
+        this.needsResize = true;
+        this.trySetup();
+    }
+
