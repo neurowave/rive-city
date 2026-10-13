@@ -15,7 +15,7 @@ Artboards
 All share the "Drive" view model (playlist rows use "Track"). world.as
 writes telemetry and reads `req` (request codes written by listeners).
 """
-import hashlib, math, os, shutil
+import hashlib, math, os
 
 # WEB=1: the published web build ships glyph-subset fonts (fonts/web, tools: pyftsubset; ASCII + ° ·)
 # and deflated mesh packs (assets/*.rz, tools/zpack.py). Default = raw files for the live preview,

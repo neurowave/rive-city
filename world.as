@@ -62,6 +62,7 @@ const KEY_P: i32 = 80;
 const KEY_F: i32 = 70;
 const KEY_T: i32 = 84;
 const KEY_H: i32 = 72;
+const KEY_O: i32 = 79;
 const KEY_E: i32 = 69;
 const KEY_ESC: i32 = 256;
 // the playable SillyScroll board: billboard design 9 = surface 14 (1-based)
@@ -4606,8 +4607,8 @@ export class World extends Layout {
             this.mode = this.mode == 2 ? 0 : 2;
         } else if (k == KEY_C) {
             this.camMode = this.camMode == 1 ? 0 : 1;
-        } else if (k == 79) {
-            // O: showroom orbit around the car
+        } else if (k == KEY_O) {
+            // showroom orbit around the car
             this.camMode = this.camMode == 2 ? 0 : 2;
         } else if (k == KEY_P) {
             this.setAutopilot(!this.autopilot);

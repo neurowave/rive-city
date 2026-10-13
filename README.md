@@ -28,7 +28,15 @@ simulation and renderer, WGSL for the shaders, and Python tools for the city, th
    time (much faster at runtime). The first build takes a little while; later ones are cached.
 
 The repository ships the generated files (`scene.rml`, `world.as`, compressed mesh packs in `assets/`), so
-no Python is needed just to run it.
+no Python is needed just to run it. Tested with Rive CLI 1.5.1 and newer.
+
+### Troubleshooting
+
+- **`script tier: interp, no wamrc`** in the log means the ahead-of-time compiler wasn't found, so scripts
+  run in the interpreter. Everything still works, just at a lower frame rate. Point `RIVE_WAMRC` at a
+  `wamrc` binary to enable it.
+- **`script heap grew … MB over 120 frames`** appears once while the city loads (the mesh packs are
+  decompressed into memory). It's a one-off allocation, not a leak, and the warning can be ignored.
 
 ## Controls
 
@@ -41,6 +49,7 @@ no Python is needed just to run it.
 | M | drive mode |
 | C | camera: cockpit / chase |
 | O | showroom camera |
+| H | hide / show the HUD |
 | N | day / night |
 | T | next track |
 | E | stop at the playable billboard ahead, and play it |
@@ -65,6 +74,8 @@ The quality switch (top left) trades resolution and effects for speed: HIGH, MED
 | Compressed mesh packs | `tools/zpack.py` -> `assets/*.rz` (decoded in-engine by `inflate.as`) |
 
 ### Rebuilding from source
+
+Python 3.9 or newer (the pinned versions in `requirements.txt` reproduce the shipped assets byte for byte):
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
