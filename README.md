@@ -1,5 +1,7 @@
 # Rive City
 
+https://github.com/user-attachments/assets/d917a871-55de-4503-94e3-45cd3c843229
+
 A drivable, procedurally generated city built entirely with the [Rive CLI](https://rive.app/docs/cli/overview):
 a 3D world rendered with Rive's GPU canvas and WGSL shaders, a hovercar cockpit whose screens and HUD are
 live Rive artboards (state machines, data binding, layouts), and a skyline of animated, clickable billboards
